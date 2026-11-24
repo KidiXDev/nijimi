@@ -151,6 +151,7 @@ async function main() {
   applyBrush();
 
   let gesture: 'paint' | 'pan' | null = null;
+  let autoFit = true;
 
   canvas.addEventListener('pointerdown', (event) => {
     if (gesture || (event.button !== 0 && event.button !== 1)) return;
@@ -167,6 +168,7 @@ async function main() {
   canvas.addEventListener('pointermove', (event) => {
     if (!gesture) return;
     if (gesture === 'pan') {
+      autoFit = false;
       editor.panBy(
         event.movementX * devicePixelRatio,
         event.movementY * devicePixelRatio
@@ -191,6 +193,7 @@ async function main() {
     (event) => {
       event.preventDefault();
       const { x, y } = canvasPoint(event);
+      autoFit = false;
       editor.zoomAt(x, y, Math.exp(-event.deltaY * ZOOM_SPEED));
       requestRender();
     },
@@ -200,6 +203,7 @@ async function main() {
   new ResizeObserver(() => {
     const { width, height } = canvasPixels();
     editor.resize(width, height);
+    if (autoFit) editor.fit();
     requestRender();
   }).observe(canvas);
 
@@ -209,6 +213,7 @@ async function main() {
     try {
       const { width, height, data } = await decodeRgba(file);
       editor.loadRgba(width, height, new Uint8Array(data.buffer));
+      autoFit = true;
       requestRender();
     } catch (error) {
       showError(error);
@@ -216,6 +221,7 @@ async function main() {
   });
 
   element('fit').addEventListener('click', () => {
+    autoFit = true;
     editor.fit();
     requestRender();
   });
