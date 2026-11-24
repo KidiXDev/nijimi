@@ -5,10 +5,11 @@
 
 body {
   display: grid;
-  grid-template-rows: auto 1fr;
+  grid-template-rows: auto minmax(0, 1fr);
   height: 100vh;
   margin: 0;
   background: #12151c;
+  color: #e6e8ec;
 }
 
 header {
@@ -17,6 +18,12 @@ header {
   align-items: center;
   gap: 8px 16px;
   padding: 8px 12px;
+}
+
+main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 220px;
+  min-height: 0;
 }
 
 label {
@@ -36,4 +43,66 @@ canvas {
   min-height: 0;
   touch-action: none;
   cursor: crosshair;
+}
+
+aside {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  padding: 0 12px 12px;
+}
+
+aside label > :is(input, select) {
+  flex: 1;
+  min-width: 0;
+}
+
+.row {
+  display: flex;
+  gap: 6px;
+}
+
+ul {
+  flex: 1;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: calc(var(--depth) * 16px);
+}
+
+li button {
+  flex: 1;
+  min-width: 0;
+  padding: 6px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+li button:hover {
+  background: #1d222d;
+}
+
+li button[aria-pressed='true'] {
+  background: #2b3850;
+}
+
+@media (max-width: 640px) {
+  main {
+    grid-template: minmax(0, 1fr) 40% / 1fr;
+  }
 }

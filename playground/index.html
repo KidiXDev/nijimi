@@ -10,17 +10,50 @@
   </head>
   <body>
     <header>
-      <label>Open <input id="file" type="file" accept="image/*" /></label>
+      <label>Open <input id="file" type="file" accept="image/*,.nijimi" /></label>
+      <button id="save" type="button">Save project</button>
+      <button id="export" type="button">Export PNG</button>
+      <button id="undo" type="button" disabled>Undo</button>
+      <button id="redo" type="button" disabled>Redo</button>
+      <button id="fit" type="button">Fit</button>
+      <button id="benchmark" type="button" title="Replaces the open document">Benchmark</button>
       <label>Size <input id="size" type="range" min="1" max="1000" value="120" /></label>
       <label>Hardness <input id="hardness" type="range" min="0" max="1" step="0.01" value="0.3" /></label>
       <label>Flow <input id="flow" type="range" min="0.01" max="1" step="0.01" value="0.5" /></label>
+      <label>Opacity <input id="brush-opacity" type="range" min="0.01" max="1" step="0.01" value="1" /></label>
       <label>Color <input id="color" type="color" value="#e0457b" /></label>
-      <button id="fit" type="button">Fit</button>
-      <button id="export" type="button">Export PNG</button>
-      <button id="benchmark" type="button">Benchmark</button>
       <output id="status">Starting…</output>
     </header>
-    <canvas id="canvas" aria-label="Image canvas"></canvas>
+    <main>
+      <canvas id="canvas" aria-label="Image canvas"></canvas>
+      <aside aria-label="Layers">
+        <div class="row">
+          <button id="add-layer" type="button">Add layer</button>
+          <button id="add-group" type="button">Add group</button>
+        </div>
+        <div class="row">
+          <button id="move-up" type="button">Up</button>
+          <button id="move-down" type="button">Down</button>
+          <button id="delete-layer" type="button">Delete</button>
+        </div>
+        <label>Name <input id="layer-name" type="text" maxlength="64" /></label>
+        <label>
+          Blend
+          <select id="layer-blend">
+            <option value="normal">Normal</option>
+            <option value="multiply">Multiply</option>
+            <option value="screen">Screen</option>
+            <option value="overlay">Overlay</option>
+            <option value="softLight">Soft light</option>
+            <option value="add">Add</option>
+            <option value="darken">Darken</option>
+            <option value="lighten">Lighten</option>
+          </select>
+        </label>
+        <label>Opacity <input id="layer-opacity" type="range" min="0" max="1" step="0.01" /></label>
+        <ul id="layers"></ul>
+      </aside>
+    </main>
     <script type="module" src="./main.ts"></script>
   </body>
 </html>
