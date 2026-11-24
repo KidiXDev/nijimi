@@ -1,10 +1,28 @@
+mod command;
+mod document;
+mod event;
+mod history;
+mod layer;
+mod project;
 mod stroke;
+mod tile;
 mod viewport;
 
-pub use stroke::{Brush, Dab, Stroke, StrokePoint};
+use serde::{Deserialize, Serialize};
+
+pub use command::Command;
+pub use document::{Document, DocumentError, LayerPlace, MAX_GROUP_DEPTH, MAX_LAYERS};
+pub use event::Event;
+pub use history::DEFAULT_HISTORY_LIMIT;
+pub use layer::{
+    BlendMode, Layer, LayerContent, LayerId, LayerProperties, MAX_NAME_LENGTH, Tiles, find_layer,
+};
+pub use project::{MAX_PROJECT_TILES, ProjectError, ProjectReader, ProjectWriter};
+pub use stroke::{Brush, Dab, MAX_BRUSH_DIAMETER, MAX_COORDINATE, Stroke, StrokePoint};
+pub use tile::{TILE_BYTES, TILE_SIZE, TileCoord};
 pub use viewport::Viewport;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Point {
     pub x: f32,
     pub y: f32,

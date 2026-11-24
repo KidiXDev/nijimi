@@ -1,14 +1,20 @@
-use crate::Point;
+use serde::{Deserialize, Serialize};
+
+use crate::{Point, TILE_SIZE, TileCoord};
+
+pub const MAX_BRUSH_DIAMETER: f32 = 4096.0;
+pub const MAX_COORDINATE: f32 = 1e6;
 
 const SPACING_RATIO: f32 = 0.1;
 const MIN_SPACING: f32 = 0.5;
 const MIN_DIAMETER: f32 = 1.0;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Brush {
     pub diameter: f32,
     pub hardness: f32,
     pub flow: f32,
+    pub opacity: f32,
     pub color: [f32; 3],
 }
 
@@ -18,15 +24,39 @@ impl Default for Brush {
             diameter: 64.0,
             hardness: 0.5,
             flow: 1.0,
+            opacity: 1.0,
             color: [0.0; 3],
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+impl Brush {
+    pub fn is_valid(&self) -> bool {
+        let [red, green, blue] = self.color;
+        (0.0..=MAX_BRUSH_DIAMETER).contains(&self.diameter)
+            && [self.hardness, self.flow, self.opacity, red, green, blue]
+                .iter()
+                .all(|value| (0.0..=1.0).contains(value))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
 pub struct StrokePoint {
+    #[serde(flatten)]
     pub position: Point,
+    #[serde(default = "full_pressure")]
     pub pressure: f32,
+}
+
+fn full_pressure() -> f32 {
+    1.0
+}
+
+impl StrokePoint {
+    pub fn is_valid(&self) -> bool {
+        let Point { x, y } = self.position;
+        x.abs() <= MAX_COORDINATE && y.abs() <= MAX_COORDINATE && self.pressure.is_finite()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -34,8 +64,35 @@ pub struct Dab {
     pub center: Point,
     pub radius: f32,
     pub hardness: f32,
-    pub color: [f32; 3],
-    pub alpha: f32,
+    pub flow: f32,
+}
+
+impl Dab {
+    pub fn tiles(&self, (width, height): (u32, u32)) -> impl Iterator<Item = TileCoord> {
+        let columns = tile_range(self.center.x, self.radius, width);
+        let rows = tile_range(self.center.y, self.radius, height);
+        rows.flat_map(move |y| columns.clone().map(move |x| TileCoord { x, y }))
+            .filter(|coord| self.overlaps(*coord))
+    }
+
+    fn overlaps(&self, coord: TileCoord) -> bool {
+        let (left, top) = coord.origin();
+        let distance = |center: f32, start: u32| {
+            let start = start as f32;
+            center - center.clamp(start, start + TILE_SIZE as f32)
+        };
+        distance(self.center.x, left).hypot(distance(self.center.y, top)) < self.radius
+    }
+}
+
+fn tile_range(center: f32, radius: f32, length: u32) -> std::ops::Range<u32> {
+    let start = (center - radius).floor().max(0.0);
+    let end = (center + radius).ceil().min(length as f32);
+    if center.is_finite() && start < end {
+        start as u32 / TILE_SIZE..(end as u32).div_ceil(TILE_SIZE)
+    } else {
+        0..0
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -58,12 +115,12 @@ impl Stroke {
     }
 
     pub fn extend(&mut self, next: StrokePoint, dabs: &mut Vec<Dab>) {
+        if !next.is_valid() {
+            return;
+        }
         let dx = next.position.x - self.last.position.x;
         let dy = next.position.y - self.last.position.y;
         let length = dx.hypot(dy);
-        if !length.is_finite() {
-            return;
-        }
 
         let mut travelled = self.until_next_dab;
         while travelled <= length {
@@ -92,8 +149,7 @@ impl Stroke {
             center: point.position,
             radius: self.diameter(point.pressure) / 2.0,
             hardness: self.brush.hardness,
-            color: self.brush.color,
-            alpha: self.brush.flow,
+            flow: self.brush.flow,
         }
     }
 }
@@ -120,6 +176,16 @@ mod tests {
             stroke.extend(*point, &mut dabs);
         }
         dabs
+    }
+
+    fn tiles_under(x: f32, y: f32, radius: f32) -> Vec<(u32, u32)> {
+        let dab = Dab {
+            center: Point::new(x, y),
+            radius,
+            hardness: 1.0,
+            flow: 1.0,
+        };
+        dab.tiles((600, 300)).map(Into::into).collect()
     }
 
     #[test]
@@ -167,7 +233,40 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_input_is_ignored() {
-        assert_eq!(stroke_through(&[at(0.0, 0.0), at(f32::NAN, 0.0)]).len(), 1);
+    fn invalid_points_are_ignored() {
+        for x in [f32::NAN, f32::INFINITY, MAX_COORDINATE * 2.0] {
+            assert_eq!(stroke_through(&[at(0.0, 0.0), at(x, 0.0)]).len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_dab_covers_every_tile_it_overlaps_inside_the_document() {
+        assert_eq!(tiles_under(100.0, 100.0, 20.0), [(0, 0)]);
+        assert_eq!(
+            tiles_under(256.0, 256.0, 1.0),
+            [(0, 0), (1, 0), (0, 1), (1, 1)]
+        );
+        assert_eq!(tiles_under(100.0, 100.0, 1e6).len(), 6);
+        assert_eq!(tiles_under(250.0, 250.0, 7.0), [(0, 0), (1, 0), (0, 1)]);
+        assert!(tiles_under(-30.0, 100.0, 20.0).is_empty());
+        assert!(tiles_under(630.0, 100.0, 20.0).is_empty());
+        assert!(tiles_under(f32::NAN, 100.0, 20.0).is_empty());
+    }
+
+    #[test]
+    fn only_finite_brushes_in_range_are_valid() {
+        assert!(Brush::default().is_valid());
+        for diameter in [f32::NAN, f32::INFINITY, -1.0, MAX_BRUSH_DIAMETER * 2.0] {
+            let brush = Brush {
+                diameter,
+                ..Brush::default()
+            };
+            assert!(!brush.is_valid());
+        }
+        let brush = Brush {
+            opacity: f32::NAN,
+            ..Brush::default()
+        };
+        assert!(!brush.is_valid());
     }
 }
