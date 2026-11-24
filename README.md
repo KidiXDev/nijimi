@@ -1,8 +1,14 @@
 # Nijimi
 
-A GPU image editing engine written in Rust. It runs in the browser through WebAssembly and WebGPU.
+An open-source, GPU-accelerated, headless image editing engine for the web.
 
-Status: proof of concept. It opens an image, paints with a soft brush, pans, zooms and exports.
+[Try the playground](https://kidixdev.github.io/nijimi/) (needs a browser with WebGPU)
+
+- **GPU-accelerated:** written in Rust, compiled to WebAssembly and rendered with WebGPU.
+- **Headless:** no toolbar, panels or framework. You give it a canvas and build your own interface on its API.
+- **For the web:** works in any web app or desktop webview that supports WebGPU.
+
+Status: proof of concept. It opens an image, paints with a soft brush, pans, zooms and exports. The API will change.
 
 ## Layout
 
