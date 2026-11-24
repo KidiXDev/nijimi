@@ -1,0 +1,16 @@
+[package]
+name = "nijimi-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+nijimi-core.workspace = true
+wgpu.workspace = true
+bytemuck = { version = "1", features = ["derive"] }
+futures-channel = "0.3"
+
+[dev-dependencies]
+pollster = "0.4"
+wgpu = { workspace = true, features = ["dx12", "vulkan", "metal"] }

@@ -1,0 +1,31 @@
+{
+  "name": "nijimi",
+  "private": true,
+  "version": "0.1.0",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "files": [
+    "pkg/*.js",
+    "pkg/*.ts",
+    "pkg/*.wasm",
+    "LICENSE-*"
+  ],
+  "exports": {
+    ".": {
+      "types": "./pkg/nijimi.d.ts",
+      "default": "./pkg/nijimi.js"
+    }
+  },
+  "scripts": {
+    "wasm": "cargo xtask",
+    "dev": "bun run wasm && vite playground",
+    "build": "bun run wasm && vite build playground --outDir ../dist --emptyOutDir",
+    "typecheck": "tsc --noEmit",
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace --all-targets -- -D warnings && cargo clippy -p nijimi-wasm --target wasm32-unknown-unknown -- -D warnings"
+  },
+  "devDependencies": {
+    "typescript": "~6.0.3",
+    "vite": "^8.3.5"
+  }
+}

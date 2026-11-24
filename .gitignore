@@ -1,0 +1,6 @@
+/target
+/pkg
+/dist
+/*.tgz
+node_modules
+/PLAN.md
