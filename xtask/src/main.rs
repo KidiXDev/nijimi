@@ -30,6 +30,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .web(true)?
         .omit_default_module_path(false)
         .typescript(true)
+        .remove_name_section(true)
         .generate(root.join("pkg"))?;
     Ok(())
 }
