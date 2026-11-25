@@ -315,6 +315,23 @@ impl Editor {
         export_pixels_js(readback, alpha)
     }
 
+    #[wasm_bindgen(unchecked_return_type = "Promise<Histogram>")]
+    pub fn histogram(
+        &mut self,
+        #[wasm_bindgen(unchecked_optional_param_type = "PixelRect")] rect: Option<JsValue>,
+    ) -> Promise {
+        let readback = optional_rect(rect).and_then(|rect| {
+            self.session
+                .borrow_mut()
+                .engine
+                .read_region(rect)
+                .map_err(|error| JsError::from(error).into())
+        });
+        future_to_promise(
+            async move { to_js(&readback?.histogram().await.map_err(JsError::from)?) },
+        )
+    }
+
     #[wasm_bindgen(js_name = pickColor, unchecked_return_type = "Promise<Uint8Array>")]
     pub fn pick_color(&mut self, x: u32, y: u32) -> Promise {
         let rect = PixelRect {

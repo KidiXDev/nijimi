@@ -71,6 +71,15 @@ export interface FillOptions extends Point {
   tolerance?: number;
 }
 
+/** Bins are indexed by sRGB byte value and exclude fully transparent pixels. */
+export interface Histogram {
+  red: number[];
+  green: number[];
+  blue: number[];
+  luma: number[];
+  pixels: number;
+}
+
 export type PreviewCommand =
   | { type: 'setLayerOpacity'; id: number; opacity: number }
   | { type: 'crop'; rect: PixelRect }

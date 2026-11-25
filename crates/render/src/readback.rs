@@ -1,5 +1,5 @@
 use futures_channel::oneshot;
-use nijimi_core::{TILE_BYTES, TILE_SIZE};
+use nijimi_core::{Histogram, TILE_BYTES, TILE_SIZE};
 
 use crate::{EngineError, tile::Tile};
 
@@ -89,6 +89,11 @@ impl Readback {
             row: row as usize,
             padded_row: padded_row as usize,
         }
+    }
+
+    pub async fn histogram(self) -> Result<Histogram, EngineError> {
+        let pixels = self.pixels().await?;
+        Ok(Histogram::from_rgba8(pixels.as_chunks().0))
     }
 
     pub async fn pixels(self) -> Result<Vec<u8>, EngineError> {

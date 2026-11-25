@@ -3,6 +3,7 @@ mod document;
 mod event;
 mod geometry;
 mod history;
+mod histogram;
 mod layer;
 mod project;
 mod stroke;
@@ -15,6 +16,7 @@ pub use command::Command;
 pub use document::{Document, DocumentError, LayerPlace, MAX_GROUP_DEPTH, MAX_LAYERS};
 pub use event::Event;
 pub use geometry::{CropRatio, PixelRect, Transform};
+pub use histogram::Histogram;
 pub use history::{DEFAULT_HISTORY_LIMIT, RasterEdit};
 pub use layer::{
     BlendMode, Layer, LayerContent, LayerId, LayerProperties, MAX_NAME_LENGTH, Tiles, find_layer,
