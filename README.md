@@ -8,7 +8,7 @@ An open-source, GPU-accelerated, headless image editing engine for the web.
 - **Headless:** no toolbar, panels or framework. You give it a canvas and build your own interface on its API.
 - **For the web:** works in any web app or desktop webview that supports WebGPU.
 
-The engine supports layers, groups, blend modes, painting, erasing, fills, canvas and layer edits, undo and project files. The API may change.
+The engine supports layers, groups, masks, color grading, painting, canvas and layer edits, undo and project files. The API may change.
 
 ## Layout
 
@@ -91,9 +91,29 @@ Vite apps must add `nijimi` to `optimizeDeps.exclude`, otherwise the dev server 
 - `importRgba(width, height, pixels, { x, y, name })` adds an undoable layer at the given document position. Pixels are straight RGBA8, with transparent space where the image does not cover the canvas.
 - `exportRegion(rect)` returns composite RGBA8. `exportLayer(id, rect?)` returns isolated RGBA8 and `exportLayerMask(id, rect?)` returns one alpha byte per pixel. The layer's own visibility and opacity are ignored. A group's descendants keep their appearance. Omitting the region exports the whole canvas.
 
+### Masks and color grading
+
+```ts
+const grade = editor.dispatch({
+  type: 'addAdjustment',
+  adjustment: { type: 'exposure', stops: 0.5 },
+})!;
+editor.dispatch({ type: 'addMask', id: grade, reveal: false });
+editor.beginMaskStroke(grade, 1, 100, 100, 1);
+editor.extendStroke(300, 200, 1);
+editor.endStroke();
+editor.render();
+```
+
+- Raster layers, groups, and adjustments can each carry one mask. `addMask` defaults to revealing the layer. A mask value of 0 hides and 1 reveals. Paint with `beginMaskStroke` or the `paintMaskStroke` command. `setMaskAlpha(id, bytes)` creates or replaces the mask from one byte per canvas pixel. `exportMask(id, rect?)` reads those mask values independently, while `exportLayerMask` reads a raster layer or group's resulting alpha.
+- An adjustment affects the layers beneath it in the same group or at the root. Opacity, blend mode, and the mask control its strength. `setAdjustment` replaces the settings and can also be used with `preview` for slider edits. Inspect settings and mask presence in `state()`.
+- Brightness, contrast, saturation, lightness, and color balance use values from −1 to 1. HSL hue is in degrees, and exposure is in stops. Levels and curve coordinates use unit values. Curves are piecewise linear with strictly increasing x values starting at 0 and ending at 1. Blur accepts an integer radius from 0 to 32 pixels. Sharpen amount is 0 to 2. Vignette settings and grain amount use unit values. Vignette feather has a minimum of 0.01.
+- Grading and filters work in linear RGB. `importCubeLut(text, options?)` adds a LUT adjustment and `setCubeLut(id, text)` replaces its table. LUTs operate on straight sRGB values. The importer accepts standalone 1D tables and 3D tables of up to 65 samples per axis, with tetrahedral interpolation for 3D. [Adobe Cube LUT specification](https://kono.phpage.fr/images/a/a1/Adobe-cube-lut-specification-1.0.pdf)
+- `await editor.histogram(rect?)` returns 256 bins for each of red, green, blue, and Rec. 709 luma of the visible composite, along with the pixel count. It uses sRGB bytes and excludes pixels whose alpha byte is zero.
+
 ### Project files
 
-`saveProject()` captures the document when it is called, so editing can continue while it runs. A `.nijimi` file is a zip with `manifest.json` and one entry per 256×256 tile, as `tiles/<layer id>/<x>_<y>` in little-endian RGBA16F with premultiplied alpha. `loadProject()` checks the whole file first and keeps the open document if anything is wrong. If several files are opened at once, the last call wins.
+`saveProject()` captures the document when it is called, so editing can continue while it runs. A `.nijimi` file is a zip with `manifest.json` and one entry per 256×256 tile, as `tiles/<layer id>/<x>_<y>` in little-endian RGBA16F with premultiplied alpha. Version 2 records the adjustment settings in the manifest, mask tiles under `masks/`, and LUT samples under `luts/`. Version 1 projects remain readable. `loadProject()` checks the whole file first and keeps the open document if anything is wrong. If several files are opened at once, the last call wins.
 
 ### GPU device loss
 
@@ -104,6 +124,7 @@ Pixels live on the GPU, so a lost device cannot be restored in place. The engine
 - The composited image is one RGBA16F texture with mipmaps (about 88 MB at 4K), in addition to the layer tiles. The largest side is the GPU texture limit.
 - Synchronous GPU edits can emit `gpuError` after a change if the GPU runs out of memory. `loadProject` and `fill` reject on GPU allocation errors before committing.
 - Saves read tiles in batches and compress them on the main thread.
+- Active blur and sharpen rebuild the canvas on dirty frames so their neighborhoods stay current across tile boundaries.
 - A project can have at most 1,000 layers, 16 nested groups and 32,768 tiles.
 - Groups cannot pass through to the layers below.
 - WebGPU is required. There is no WebGL fallback.
