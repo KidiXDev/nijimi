@@ -83,6 +83,15 @@ pub struct LayerPlace {
     pub index: usize,
 }
 
+impl LayerPlace {
+    pub fn requested(parent: Option<Option<LayerId>>, index: Option<usize>) -> Option<Self> {
+        (parent.is_some() || index.is_some()).then(|| Self {
+            parent: parent.flatten(),
+            index: index.unwrap_or(usize::MAX),
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct Document<T> {
     size: (u32, u32),

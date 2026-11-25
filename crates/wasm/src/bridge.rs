@@ -1,6 +1,7 @@
 use js_sys::JSON;
 use nijimi_core::{
     Adjustment, Document, Layer, LayerContent, LayerId, LayerPlace, LayerProperties, LutInfo,
+    deserialize_present,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use wasm_bindgen::prelude::*;
@@ -141,8 +142,7 @@ export type Command =
   | PreviewCommand
   | { type: 'setLayerBlendMode'; id: number; blendMode: BlendMode }
   | { type: 'selectLayer'; id: number }
-  | { type: 'paintStroke'; layer: number; brush: Brush; points: StrokePoint[] }
-  | { type: 'paintWithDynamics'; layer: number; brush: Brush; dynamics: BrushDynamics; points: StrokePoint[] }
+  | { type: 'paintStroke'; layer: number; brush: Brush; dynamics?: BrushDynamics; points: StrokePoint[] }
   | { type: 'eraseStroke'; layer: number; brush: Brush; dynamics?: BrushDynamics; points: StrokePoint[] }
   | { type: 'undo' }
   | { type: 'redo' };
@@ -190,24 +190,15 @@ pub(crate) struct ImportOptions {
     pub x: i32,
     pub y: i32,
     pub name: Option<String>,
-    #[serde(deserialize_with = "present_parent")]
+    #[serde(deserialize_with = "deserialize_present")]
     pub parent: Option<Option<LayerId>>,
     pub index: Option<usize>,
 }
 
 impl ImportOptions {
     pub fn place(&self) -> Option<LayerPlace> {
-        (self.parent.is_some() || self.index.is_some()).then(|| LayerPlace {
-            parent: self.parent.flatten(),
-            index: self.index.unwrap_or(usize::MAX),
-        })
+        LayerPlace::requested(self.parent, self.index)
     }
-}
-
-fn present_parent<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<Option<LayerId>>, D::Error> {
-    Option::<LayerId>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]

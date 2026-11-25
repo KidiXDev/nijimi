@@ -44,6 +44,7 @@ impl Editor {
             layer,
             brush,
             points: points.iter().map(|(x, y)| at(*x, *y)).collect(),
+            dynamics: BrushDynamics::default(),
         });
     }
 
@@ -613,7 +614,7 @@ fn every_command_round_trips_through_undo_and_redo() {
         editor.paint(child, hard_brush(), &[(20.0, 20.0), (580.0, 290.0)]);
     });
     assert_pixels_undoable("paint with dynamics", |editor, _, child| {
-        editor.dispatch(Command::PaintWithDynamics {
+        editor.dispatch(Command::PaintStroke {
             layer: child,
             brush: hard_brush(),
             dynamics: BrushDynamics {
@@ -647,6 +648,7 @@ fn invalid_commands_are_rejected() {
             layer,
             brush,
             points: points.to_vec(),
+            dynamics: BrushDynamics::default(),
         })
     };
     let invalid_brush = Brush {

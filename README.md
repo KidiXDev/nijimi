@@ -70,7 +70,7 @@ Vite apps must add `nijimi` to `optimizeDeps.exclude`, otherwise the dev server 
 ### Document and commands
 
 - The engine owns the document. Read it with `state()` and change it with `dispatch(command)`. The `Command` type in `nijimi.d.ts` lists every command.
-- `beginStroke`, `extendStroke` and `endStroke` take canvas pixels and paint on the selected layer. The stroke becomes one undoable change at `endStroke`. `cancelStroke` drops it. The `paintStroke` command paints a whole stroke in document pixels.
+- `beginStroke`, `extendStroke` and `endStroke` take canvas pixels and paint on the selected layer. The stroke becomes one undoable change at `endStroke`. `cancelStroke` drops it. The `paintStroke` command paints a whole stroke in document pixels and accepts optional `dynamics`.
 - `dispatch` finishes a stroke that is in progress and cancels any live preview before it runs the command.
 - `dispatch` throws when a command is invalid and leaves the document alone. `addLayer`, `addGroup` and `importRgba` return the new id.
 - Flow builds up within a stroke. Opacity limits the whole stroke, so it does not build up where a stroke overlaps itself.

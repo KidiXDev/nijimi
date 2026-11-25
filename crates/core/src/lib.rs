@@ -14,7 +14,7 @@ mod viewport;
 use serde::{Deserialize, Serialize};
 
 pub use adjustment::{Adjustment, CubeError, CubeLut, LutInfo, LutKind};
-pub use command::Command;
+pub use command::{Command, deserialize_present};
 pub use document::{Document, DocumentError, LayerPlace, MAX_GROUP_DEPTH, MAX_LAYERS};
 pub use event::Event;
 pub use geometry::{CropRatio, PixelRect, Transform};
