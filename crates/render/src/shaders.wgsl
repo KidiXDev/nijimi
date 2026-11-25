@@ -49,18 +49,20 @@ struct Resample {
     x: vec2f,
     y: vec2f,
     offset: vec2f,
-    size: vec2f,
+    origin: vec2i,
+    size: vec2i,
 }
 
 @group(0) @binding(1) var<uniform> resample: Resample;
 
 @fragment
 fn resample_fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
-    let pixel = vec2f(dot(resample.x, position.xy), dot(resample.y, position.xy)) + resample.offset;
-    if any(pixel < vec2f(0.0)) || any(pixel >= resample.size) {
+    let point = vec2f(dot(resample.x, position.xy), dot(resample.y, position.xy)) + resample.offset;
+    let pixel = vec2i(floor(point)) - resample.origin;
+    if any(pixel < vec2i(0)) || any(pixel >= resample.size) {
         discard;
     }
-    return textureLoad(source, vec2i(pixel), 0);
+    return textureLoad(source, pixel, 0);
 }
 
 // Export

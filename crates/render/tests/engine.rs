@@ -1700,3 +1700,26 @@ fn cropped_pixels_stay_gone_when_the_canvas_grows_again() {
     assert_eq!(editor.pixel(255, 255), [255, 0, 0, 255]);
     assert_eq!(editor.pixel(400, 400), [0; 4]);
 }
+
+#[test]
+fn rotated_layers_have_no_holes_at_tile_borders() {
+    let mut editor = Editor::new((2048, 2048));
+    editor
+        .engine
+        .load_rgba(2048, 2048, &[255, 0, 0, 255].repeat(2048 * 2048))
+        .unwrap();
+    editor.dispatch(Command::TransformLayer {
+        id: FIRST_LAYER,
+        transform: Transform {
+            rotation: 45.0,
+            ..Transform::default()
+        },
+    });
+    let rgba = editor.pixels();
+    let holes = (0..2048i32)
+        .flat_map(|y| (0..2048i32).map(move |x| (x, y)))
+        .filter(|(x, y)| (x - 1024).pow(2) + (y - 1024).pow(2) < 1000i32.pow(2))
+        .filter(|(x, y)| pixel_in(&rgba, 2048, *x as u32, *y as u32)[3] != 255)
+        .count();
+    assert_eq!(holes, 0);
+}
