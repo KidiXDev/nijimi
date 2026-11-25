@@ -14,7 +14,7 @@ use wgpu::{
 
 use crate::{
     gpu::{CLEAR, Gpu, begin_pass, draw_fullscreen},
-    grade::{Grade, neighbors},
+    grade::{Grade, grown, neighbors},
     stroke::ActiveStroke,
     tile::{TILE_FORMAT, TileRef},
 };
@@ -143,15 +143,10 @@ impl Composite {
     ) {
         gpu.luts.prune();
         let layers = document.layers();
-        let graded = has_visible_grade(layers, |_| true);
-        // shortcut: spatial effects redraw the canvas, propagate dirty halos per stage if grading needs faster paint previews.
-        let expanded;
-        let dirty = if graded && has_visible_grade(layers, Adjustment::is_spatial) {
-            expanded = TileCoord::all(document.size()).collect::<BTreeSet<_>>();
-            &expanded
-        } else {
-            dirty
-        };
+        let graded = has_visible_grade(layers);
+        let dirty = &(0..spatial_steps(layers)).fold(dirty.clone(), |dirty, _| {
+            grown(&dirty, document.size(), (1, 1))
+        });
         if self.was_graded && !graded {
             self.scratch.truncate(32);
         }
@@ -385,11 +380,20 @@ fn shown<T>(layer: &Layer<T>) -> bool {
     layer.properties.visible && layer.properties.opacity > 0.0
 }
 
-fn has_visible_grade<T>(layers: &[Layer<T>], check: impl Fn(&Adjustment) -> bool + Copy) -> bool {
+fn has_visible_grade<T>(layers: &[Layer<T>]) -> bool {
     layers
         .iter()
         .filter(|layer| shown(layer))
-        .any(|layer| layer.grade().is_some_and(check) || has_visible_grade(layer.children(), check))
+        .any(|layer| layer.grade().is_some() || has_visible_grade(layer.children()))
+}
+
+fn spatial_steps<T>(layers: &[Layer<T>]) -> usize {
+    let visible = || layers.iter().filter(|layer| shown(layer));
+    let here = visible()
+        .filter(|layer| layer.grade().is_some_and(Adjustment::is_spatial))
+        .count();
+    let nested = visible().map(|layer| spatial_steps(layer.children())).max();
+    here + nested.unwrap_or(0)
 }
 
 struct Planner<'a> {
@@ -506,22 +510,28 @@ impl Planner<'_> {
         layers: &[Layer<TileRef>],
         coords: &BTreeSet<TileCoord>,
     ) -> Tiles<TileRef> {
-        let mut groups = BTreeMap::new();
-        for layer in layers.iter().filter(|layer| shown(layer)) {
-            if has_visible_grade(layer.children(), |_| true) {
-                groups.insert(layer.id, self.graded_stack(layer.children(), coords));
+        let mut output = coords.clone();
+        let mut stages = Vec::new();
+        for (index, layer) in layers.iter().enumerate().rev() {
+            if let Some(adjustment) = layer.grade().filter(|_| shown(layer)) {
+                let input = if adjustment.is_spatial() {
+                    grown(&output, self.size, (1, 1))
+                } else {
+                    output.clone()
+                };
+                stages.push((index, adjustment, std::mem::replace(&mut output, input)));
             }
         }
+        let mut input = output;
         let mut tiles = Tiles::new();
         let mut start = 0;
-        for (index, layer) in layers.iter().enumerate().filter(|(_, layer)| shown(layer)) {
-            if let Some(adjustment) = layer.grade() {
-                self.blend_run(&layers[start..index], coords, &mut groups, &mut tiles);
-                tiles = self.apply_grade(layer, adjustment, coords, tiles);
-                start = index + 1;
-            }
+        for (index, adjustment, output) in stages.into_iter().rev() {
+            self.blend_run(&layers[start..index], &input, &mut tiles);
+            tiles = self.apply_grade(&layers[index], adjustment, &output, tiles);
+            input = output;
+            start = index + 1;
         }
-        self.blend_run(&layers[start..], coords, &mut groups, &mut tiles);
+        self.blend_run(&layers[start..], &input, &mut tiles);
         tiles
     }
 
@@ -529,15 +539,20 @@ impl Planner<'_> {
         &mut self,
         layers: &[Layer<TileRef>],
         coords: &BTreeSet<TileCoord>,
-        groups: &mut BTreeMap<LayerId, Tiles<TileRef>>,
         tiles: &mut Tiles<TileRef>,
     ) {
         if layers.is_empty() {
             return;
         }
+        let mut groups = BTreeMap::new();
+        for layer in layers.iter().filter(|layer| shown(layer)) {
+            if has_visible_grade(layer.children()) {
+                groups.insert(layer.id, self.graded_stack(layer.children(), coords));
+            }
+        }
         for &coord in coords {
             self.coord = coord;
-            let sources = self.sources(layers, groups);
+            let sources = self.sources(layers, &mut groups);
             if !sources.is_empty() {
                 let backdrop = tiles
                     .remove(&coord)
@@ -570,7 +585,8 @@ impl Planner<'_> {
             )
         };
         let result = if matches!(adjustment, Adjustment::Blur { .. }) {
-            let horizontal = self.grade_pass(layer, coords, &grade(true), &before, &before, true);
+            let rows = grown(coords, self.size, (0, 1));
+            let horizontal = self.grade_pass(layer, &rows, &grade(true), &before, &before, true);
             let result = self.grade_pass(layer, coords, &grade(false), &horizontal, &before, true);
             self.scratch.extend(horizontal.into_values());
             result

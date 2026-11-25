@@ -70,14 +70,14 @@ Vite apps must add `nijimi` to `optimizeDeps.exclude`, otherwise the dev server 
 ### Document and commands
 
 - The engine owns the document. Read it with `state()` and change it with `dispatch(command)`. The `Command` type in `nijimi.d.ts` lists every command.
-- `beginStroke`, `extendStroke` and `endStroke` take canvas pixels and paint on the selected layer. The stroke becomes one undoable change at `endStroke`. `cancelStroke` drops it. The `paintStroke` command paints a whole stroke in document pixels.
+- `beginStroke`, `extendStroke` and `endStroke` take canvas pixels and paint on the selected layer. The stroke becomes one undoable change at `endStroke`. `cancelStroke` drops it. The `paintStroke` command paints a whole stroke in document pixels and accepts optional `dynamics`.
 - `dispatch` finishes a stroke that is in progress and cancels any live preview before it runs the command.
 - `dispatch` throws when a command is invalid and leaves the document alone. `addLayer`, `addGroup` and `importRgba` return the new id.
 - Flow builds up within a stroke. Opacity limits the whole stroke, so it does not build up where a stroke overlaps itself.
 - Groups are isolated: their layers blend with each other first, then the group blends with what is below it.
 - Colors and pixels use sRGB values, and layers blend in that space.
 - Events arrive after the call that caused them. On `documentReplaced`, read `state()` again.
-- Undo keeps replaced tiles, up to 256 MB by default. `setHistoryLimit(bytes)` changes that.
+- Undo keeps replaced tiles, up to 256 MB by default. `setHistoryLimit(bytes)` changes that. The latest change stays undoable even when it is larger than the limit, unless the limit is 0.
 - `free()` releases the GPU memory.
 
 ### Editing tools
@@ -87,7 +87,7 @@ Vite apps must add `nijimi` to `optimizeDeps.exclude`, otherwise the dev server 
 - `transformLayer` applies scale, clockwise rotation in degrees, then translation. A negative scale flips an axis. The default pivot is the canvas center. Group transforms apply to all descendant raster layers. The editor resamples with nearest-neighbor sampling.
 - Call `preview(command)` repeatedly with opacity or geometry changes. Each update starts from the committed state. `state()` and rendering include the preview. `commitPreview()` records one undo step and `cancelPreview()` restores the committed view. Saves capture the committed document.
 - Use `Editor.brushPreset('round')` as a starting brush, `setBrushDynamics({ pressureCurve: 'soft', stabilizer: 0.5 })` to tune it, and `setEraser(true)` to erase with the same controls. Pass browser pen pressure to each stroke sample and use 1 for the mouse.
-- `documentPoint(x, y)` converts canvas pixels to document coordinates. `pickColor(x, y)` reads a composited pixel as four RGBA bytes. `fill({ id, x, y, color, tolerance })` replaces the connected matching region on a raster layer. Fill uses straight RGBA values from 0 to 1, with a default tolerance of 0.
+- `documentPoint(x, y)` converts canvas pixels to fractional document coordinates. Round them down with `Math.floor` before passing them to `pickColor` or `fill`. `pickColor(x, y)` reads a composited pixel as four RGBA bytes. `fill({ id, x, y, color, tolerance })` replaces the connected matching region on a raster layer. Fill uses straight RGBA values from 0 to 1, with a default tolerance of 0.
 - `importRgba(width, height, pixels, { x, y, name })` adds an undoable layer at the given document position. Pixels are straight RGBA8, with transparent space where the image does not cover the canvas.
 - `exportRegion(rect)` returns composite RGBA8. `exportLayer(id, rect?)` returns isolated RGBA8 and `exportLayerMask(id, rect?)` returns one alpha byte per pixel. The layer's own visibility and opacity are ignored. A group's descendants keep their appearance. Omitting the region exports the whole canvas.
 
@@ -124,7 +124,7 @@ Pixels live on the GPU, so a lost device cannot be restored in place. The engine
 - The composited image is one RGBA16F texture with mipmaps (about 88 MB at 4K), in addition to the layer tiles. The largest side is the GPU texture limit.
 - Synchronous GPU edits can emit `gpuError` after a change if the GPU runs out of memory. `loadProject` and `fill` reject on GPU allocation errors before committing.
 - Saves read tiles in batches and compress them on the main thread.
-- Active blur and sharpen rebuild the canvas on dirty frames so their neighborhoods stay current across tile boundaries.
+- Each visible blur or sharpen also redraws the tiles next to a change, so painting slows down as they stack up.
 - A project can have at most 1,000 layers, 16 nested groups and 32,768 tiles.
 - Groups cannot pass through to the layers below.
 - WebGPU is required. There is no WebGL fallback.

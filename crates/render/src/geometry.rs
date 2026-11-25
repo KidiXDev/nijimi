@@ -88,7 +88,8 @@ struct Resample {
     x: [f32; 2],
     y: [f32; 2],
     offset: [f32; 2],
-    size: [f32; 2],
+    origin: [i32; 2],
+    size: [i32; 2],
 }
 
 struct Source<'a> {
@@ -183,8 +184,9 @@ pub(crate) fn remap(
                 let uniform = Resample {
                     x: inverse.x,
                     y: inverse.y,
-                    offset: [x - left as f32, y - top as f32],
-                    size: [source.size.0 as f32, source.size.1 as f32],
+                    offset: [x, y],
+                    origin: [left as i32, top as i32],
+                    size: [source.size.0 as i32, source.size.1 as i32],
                 };
                 let buffer = gpu
                     .device

@@ -44,6 +44,7 @@ impl Editor {
             layer,
             brush,
             points: points.iter().map(|(x, y)| at(*x, *y)).collect(),
+            dynamics: BrushDynamics::default(),
         });
     }
 
@@ -613,7 +614,7 @@ fn every_command_round_trips_through_undo_and_redo() {
         editor.paint(child, hard_brush(), &[(20.0, 20.0), (580.0, 290.0)]);
     });
     assert_pixels_undoable("paint with dynamics", |editor, _, child| {
-        editor.dispatch(Command::PaintWithDynamics {
+        editor.dispatch(Command::PaintStroke {
             layer: child,
             brush: hard_brush(),
             dynamics: BrushDynamics {
@@ -647,6 +648,7 @@ fn invalid_commands_are_rejected() {
             layer,
             brush,
             points: points.to_vec(),
+            dynamics: BrushDynamics::default(),
         })
     };
     let invalid_brush = Brush {
@@ -1673,4 +1675,227 @@ fn blur_crosses_both_tile_axes_inside_an_isolated_group() {
     assert_eq!(editor.pixel(256, 256), [0; 4]);
     editor.dispatch(Command::Undo);
     assert_eq!(editor.pixels(), graded);
+}
+
+#[test]
+fn cropped_pixels_stay_gone_when_the_canvas_grows_again() {
+    let mut editor = Editor::new((512, 512));
+    editor
+        .engine
+        .load_rgba(512, 512, &[255, 0, 0, 255].repeat(512 * 512))
+        .unwrap();
+    assert_eq!(editor.pixel(400, 400), [255, 0, 0, 255]);
+    editor.dispatch(Command::Crop {
+        rect: PixelRect {
+            x: 0,
+            y: 0,
+            width: 256,
+            height: 256,
+        },
+    });
+    editor.dispatch(Command::ExtendCanvas {
+        left: 0,
+        top: 0,
+        right: 256,
+        bottom: 256,
+    });
+    assert_eq!(editor.pixel(255, 255), [255, 0, 0, 255]);
+    assert_eq!(editor.pixel(400, 400), [0; 4]);
+}
+
+#[test]
+fn rotated_layers_have_no_holes_at_tile_borders() {
+    let mut editor = Editor::new((2048, 2048));
+    editor
+        .engine
+        .load_rgba(2048, 2048, &[255, 0, 0, 255].repeat(2048 * 2048))
+        .unwrap();
+    editor.dispatch(Command::TransformLayer {
+        id: FIRST_LAYER,
+        transform: Transform {
+            rotation: 45.0,
+            ..Transform::default()
+        },
+    });
+    let rgba = editor.pixels();
+    let holes = (0..2048i32)
+        .flat_map(|y| (0..2048i32).map(move |x| (x, y)))
+        .filter(|(x, y)| (x - 1024).pow(2) + (y - 1024).pow(2) < 1000i32.pow(2))
+        .filter(|(x, y)| pixel_in(&rgba, 2048, *x as u32, *y as u32)[3] != 255)
+        .count();
+    assert_eq!(holes, 0);
+}
+
+#[test]
+fn adjustments_match_reference_values() {
+    use Adjustment::*;
+    let cases = [
+        (
+            BrightnessContrast {
+                brightness: 0.1,
+                contrast: 0.25,
+            },
+            vec![((0, 0), [71, 158, 239])],
+        ),
+        (
+            Levels {
+                black: 0.05,
+                white: 0.6,
+                gamma: 1.5,
+                output_black: 0.1,
+                output_white: 0.8,
+            },
+            vec![((0, 0), [94, 172, 223])],
+        ),
+        (
+            Curves {
+                points: vec![
+                    Point::new(0.0, 0.0),
+                    Point::new(0.25, 0.5),
+                    Point::new(1.0, 0.9),
+                ],
+            },
+            vec![((0, 0), [90, 176, 210])],
+        ),
+        (
+            Hsl {
+                hue: 90.0,
+                saturation: 0.2,
+                lightness: 0.1,
+            },
+            vec![((0, 0), [220, 15, 204])],
+        ),
+        (
+            Hsl {
+                hue: -60.0,
+                saturation: -0.5,
+                lightness: -0.3,
+            },
+            vec![((0, 0), [97, 146, 131])],
+        ),
+        (
+            ColorBalance {
+                shadows: [0.3, 0.0, -0.2],
+                midtones: [0.0, 0.2, 0.0],
+                highlights: [0.1, 0.0, 0.4],
+            },
+            vec![((0, 0), [108, 137, 183])],
+        ),
+        (
+            Vignette {
+                amount: 0.8,
+                radius: 0.2,
+                feather: 0.6,
+            },
+            vec![
+                ((0, 0), [26, 59, 91]),
+                ((30, 30), [47, 97, 147]),
+                ((19, 10), [60, 122, 183]),
+            ],
+        ),
+        (
+            Grain {
+                amount: 0.8,
+                seed: 42,
+            },
+            vec![((0, 0), [0, 110, 182]), ((7, 3), [0, 108, 181])],
+        ),
+    ];
+    let mut editor = Editor::new((40, 40));
+    for (adjustment, expected) in cases {
+        editor
+            .engine
+            .load_rgba(40, 40, &[64, 128, 192, 255].repeat(1600))
+            .unwrap();
+        add_adjustment(&mut editor, adjustment.clone());
+        for ((x, y), [red, green, blue]) in expected {
+            let actual = editor.pixel(x, y);
+            let near = actual
+                .iter()
+                .zip([red, green, blue, 255])
+                .all(|(a, b)| a.abs_diff(b) <= 1);
+            assert!(near, "{adjustment:?} at {x}, {y}: {actual:?}");
+        }
+    }
+}
+
+#[test]
+fn blur_and_sharpen_match_reference_values_across_a_tile_border() {
+    let mut editor = Editor::new((512, 8));
+    let edge: Vec<u8> = (0..512 * 8)
+        .flat_map(|index| {
+            let value = if index % 512 < 256 { 64 } else { 192 };
+            [value, value, value, 255]
+        })
+        .collect();
+    for (adjustment, expected) in [
+        (
+            Adjustment::Blur { radius: 4 },
+            vec![(250, 64), (253, 87), (255, 135), (256, 157), (258, 185)],
+        ),
+        (
+            Adjustment::Sharpen { amount: 0.7 },
+            vec![(254, 64), (255, 0), (256, 205)],
+        ),
+    ] {
+        editor.engine.load_rgba(512, 8, &edge).unwrap();
+        add_adjustment(&mut editor, adjustment);
+        for (x, value) in expected {
+            assert_near(&editor.pixel(x, 4), &[value, value, value, 255], 1);
+        }
+    }
+}
+
+#[test]
+fn painting_under_spatial_adjustments_matches_a_reopened_document() {
+    let mut editor = Editor::new((1600, 1400));
+    editor
+        .engine
+        .load_rgba(1600, 1400, &test_image((1600, 1400)))
+        .unwrap();
+    add_adjustment(&mut editor, Adjustment::Sharpen { amount: 1.0 });
+    let group = editor
+        .dispatch(Command::AddGroup {
+            name: None,
+            parent: None,
+            index: None,
+        })
+        .unwrap();
+    let inside = Some(Some(group));
+    let layer = editor
+        .dispatch(Command::AddLayer {
+            name: None,
+            parent: inside,
+            index: None,
+        })
+        .unwrap();
+    let wide = Brush {
+        diameter: 2400.0,
+        color: [0.2, 0.5, 0.9],
+        ..hard_brush()
+    };
+    editor.paint(layer, wide, &[(800.0, 700.0)]);
+    for radius in [32, 20] {
+        editor.dispatch(Command::AddAdjustment {
+            name: None,
+            parent: inside,
+            index: None,
+            adjustment: Adjustment::Blur { radius },
+        });
+    }
+    editor.dispatch(Command::SetLayerOpacity {
+        id: group,
+        opacity: 0.8,
+    });
+    editor.pixels();
+    for (target, point) in [
+        (layer, (740.0, 740.0)),
+        (layer, (1060.0, 1300.0)),
+        (FIRST_LAYER, (1013.5, 100.0)),
+    ] {
+        editor.paint(target, hard_brush(), &[point]);
+        let mut reopened = Editor::new((10, 10));
+        reopened.load(editor.save()).unwrap();
+        assert_same(&editor.pixels(), &reopened.pixels());
+    }
 }

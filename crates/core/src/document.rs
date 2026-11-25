@@ -83,6 +83,15 @@ pub struct LayerPlace {
     pub index: usize,
 }
 
+impl LayerPlace {
+    pub fn requested(parent: Option<Option<LayerId>>, index: Option<usize>) -> Option<Self> {
+        (parent.is_some() || index.is_some()).then(|| Self {
+            parent: parent.flatten(),
+            index: index.unwrap_or(usize::MAX),
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct Document<T> {
     size: (u32, u32),
@@ -651,8 +660,7 @@ impl<T: Clone> Document<T> {
                 let rasters = self.swap_plane(rasters, false);
                 let masks = self.swap_plane(masks, true);
                 if old_size != size {
-                    self.dirty.retain(|coord| coord.is_inside(size));
-                    self.mark_all_dirty();
+                    self.dirty = TileCoord::all(size).collect();
                     self.events.push(Event::CanvasResized {
                         width: size.0,
                         height: size.1,

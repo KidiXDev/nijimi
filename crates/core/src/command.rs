@@ -13,19 +13,19 @@ use crate::{
 pub enum Command {
     AddLayer {
         name: Option<String>,
-        #[serde(default, deserialize_with = "present")]
+        #[serde(default, deserialize_with = "deserialize_present")]
         parent: Option<Option<LayerId>>,
         index: Option<usize>,
     },
     AddGroup {
         name: Option<String>,
-        #[serde(default, deserialize_with = "present")]
+        #[serde(default, deserialize_with = "deserialize_present")]
         parent: Option<Option<LayerId>>,
         index: Option<usize>,
     },
     AddAdjustment {
         name: Option<String>,
-        #[serde(default, deserialize_with = "present")]
+        #[serde(default, deserialize_with = "deserialize_present")]
         parent: Option<Option<LayerId>>,
         index: Option<usize>,
         adjustment: Adjustment,
@@ -81,18 +81,14 @@ pub enum Command {
         layer: LayerId,
         brush: Brush,
         points: Vec<StrokePoint>,
+        #[serde(default)]
+        dynamics: BrushDynamics,
     },
     EraseStroke {
         layer: LayerId,
         brush: Brush,
         points: Vec<StrokePoint>,
         #[serde(default)]
-        dynamics: BrushDynamics,
-    },
-    PaintWithDynamics {
-        layer: LayerId,
-        brush: Brush,
-        points: Vec<StrokePoint>,
         dynamics: BrushDynamics,
     },
     Crop {
@@ -124,7 +120,7 @@ fn reveal() -> bool {
     true
 }
 
-fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+pub fn deserialize_present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
 ) -> Result<Option<T>, D::Error> {
     T::deserialize(deserializer).map(Some)
@@ -160,14 +156,18 @@ mod tests {
     }
 
     #[test]
-    fn pressure_is_optional() {
+    fn pressure_and_dynamics_are_optional() {
         let command = parse(
             r#"{"type":"paintStroke","layer":1,"points":[{"x":1,"y":2},{"x":3,"y":4,"pressure":0.5}],
             "brush":{"diameter":9,"hardness":1,"flow":1,"opacity":1,"color":[0,0.5,1]}}"#,
         );
-        let Command::PaintStroke { points, .. } = command else {
+        let Command::PaintStroke {
+            points, dynamics, ..
+        } = command
+        else {
             panic!("expected a stroke");
         };
+        assert_eq!(dynamics, BrushDynamics::default());
         assert_eq!((points[0].pressure, points[1].pressure), (1.0, 0.5));
     }
 

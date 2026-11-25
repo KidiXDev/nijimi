@@ -591,12 +591,20 @@ impl Engine {
                 name,
                 parent,
                 index,
-            } => return Ok(Some(document.add_layer(name, place(parent, index))?)),
+            } => {
+                return Ok(Some(
+                    document.add_layer(name, LayerPlace::requested(parent, index))?,
+                ));
+            }
             Command::AddGroup {
                 name,
                 parent,
                 index,
-            } => return Ok(Some(document.add_group(name, place(parent, index))?)),
+            } => {
+                return Ok(Some(
+                    document.add_group(name, LayerPlace::requested(parent, index))?,
+                ));
+            }
             Command::AddAdjustment {
                 name,
                 parent,
@@ -605,7 +613,7 @@ impl Engine {
             } => {
                 return Ok(Some(document.add_adjustment(
                     name,
-                    place(parent, index),
+                    LayerPlace::requested(parent, index),
                     adjustment,
                 )?));
             }
@@ -631,17 +639,6 @@ impl Engine {
             }
             Command::SelectLayer { id } => document.select_layer(id)?,
             Command::PaintStroke {
-                layer,
-                brush,
-                points,
-            } => self.paint_stroke(
-                layer,
-                brush,
-                BrushDynamics::default(),
-                StrokeMode::Paint,
-                &points,
-            )?,
-            Command::PaintWithDynamics {
                 layer,
                 brush,
                 points,
@@ -949,16 +946,6 @@ impl Engine {
             let _ = self.events.unbounded_send(event);
         }
     }
-}
-
-fn place(parent: Option<Option<LayerId>>, index: Option<usize>) -> Option<LayerPlace> {
-    if parent.is_none() && index.is_none() {
-        return None;
-    }
-    Some(LayerPlace {
-        parent: parent.flatten(),
-        index: index.unwrap_or(usize::MAX),
-    })
 }
 
 fn checked_region(size: (u32, u32), region: Option<PixelRect>) -> Result<PixelRect, EngineError> {
