@@ -6,7 +6,7 @@ use wgpu::{BindingResource::TextureView, util::DeviceExt};
 
 use crate::{
     EngineError,
-    gpu::{CLEAR, Gpu, begin_pass},
+    gpu::{CLEAR, Gpu, REVEALED, begin_pass},
     tile::TileRef,
 };
 
@@ -104,6 +104,7 @@ pub(crate) fn remap(
     old_size: (u32, u32),
     new_size: (u32, u32),
     affine: Affine,
+    reveal: bool,
 ) -> Tiles<TileRef> {
     if before.is_empty() || (affine == Affine::translation(0, 0) && old_size == new_size) {
         return before.clone();
@@ -169,7 +170,11 @@ pub(crate) fn remap(
             let target = Rc::new(gpu.new_tile());
             let (left, top) = coord.origin();
             let [x, y] = inverse.map([left as f32, top as f32]);
-            let mut pass = begin_pass(encoder, target.view(), CLEAR);
+            let mut pass = begin_pass(
+                encoder,
+                target.view(),
+                if reveal { REVEALED } else { CLEAR },
+            );
             pass.set_pipeline(&gpu.pipelines.resample);
             for source in sources {
                 let (left, top, width, height) = source.clip;

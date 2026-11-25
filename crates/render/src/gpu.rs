@@ -13,6 +13,7 @@ use wgpu::ShaderStages;
 use crate::{
     EngineError,
     composite::LAYERS_PER_PASS,
+    grade::{LutCache, make_table},
     stroke::DabInstance,
     tile::{COVERAGE_FORMAT, TILE_FORMAT, Tile, TileRef},
 };
@@ -24,6 +25,9 @@ pub(crate) struct Layouts {
     pub resample: wgpu::BindGroupLayout,
     pub export: wgpu::BindGroupLayout,
     pub stroke: wgpu::BindGroupLayout,
+    pub apply_mask: wgpu::BindGroupLayout,
+    pub grade: wgpu::BindGroupLayout,
+    pub copy_tile: wgpu::BindGroupLayout,
     pub composite: wgpu::BindGroupLayout,
     pub mipmap: wgpu::BindGroupLayout,
     pub present: wgpu::BindGroupLayout,
@@ -31,11 +35,16 @@ pub(crate) struct Layouts {
 
 pub(crate) struct Pipelines {
     pub import: wgpu::RenderPipeline,
+    pub import_mask: wgpu::RenderPipeline,
     pub erase: wgpu::RenderPipeline,
     pub resample: wgpu::RenderPipeline,
     pub export: wgpu::RenderPipeline,
     pub dab: wgpu::RenderPipeline,
     pub stroke: wgpu::RenderPipeline,
+    pub mask_stroke: wgpu::RenderPipeline,
+    pub apply_mask: wgpu::RenderPipeline,
+    pub grade: wgpu::RenderPipeline,
+    pub copy_tile: wgpu::RenderPipeline,
     pub composite: wgpu::RenderPipeline,
     pub mipmap: wgpu::RenderPipeline,
     pub present: wgpu::RenderPipeline,
@@ -48,6 +57,9 @@ pub(crate) struct Gpu {
     pub pipelines: Pipelines,
     pub sampler: wgpu::Sampler,
     pub empty_tile: TileRef,
+    revealed_tile: TileRef,
+    pub luts: LutCache,
+    pub empty_grade_table: wgpu::Buffer,
     lost: Arc<AtomicBool>,
 }
 
@@ -72,6 +84,11 @@ impl Gpu {
             ..Default::default()
         });
         let empty_tile = Rc::new(Tile::new(&device, TILE_FORMAT));
+        let revealed_tile = Rc::new(Tile::new(&device, TILE_FORMAT));
+        let mut encoder = device.create_command_encoder(&Default::default());
+        drop(begin_pass(&mut encoder, revealed_tile.view(), REVEALED));
+        queue.submit([encoder.finish()]);
+        let empty_grade_table = make_table(&device, &[[0.0; 4]]);
         Self {
             device,
             queue,
@@ -79,6 +96,9 @@ impl Gpu {
             pipelines,
             sampler,
             empty_tile,
+            revealed_tile,
+            luts: LutCache::default(),
+            empty_grade_table,
             lost,
         }
     }
@@ -99,6 +119,14 @@ impl Gpu {
             return Err(EngineError::ImageTooLarge { limit });
         }
         Ok(())
+    }
+
+    pub fn mask_default(&self, reveal: bool) -> &TileRef {
+        if reveal {
+            &self.revealed_tile
+        } else {
+            &self.empty_tile
+        }
     }
 
     pub fn new_tile(&self) -> Tile {
@@ -182,6 +210,13 @@ pub(crate) fn begin_pass<'a>(
     })
 }
 
+pub(crate) const REVEALED: wgpu::LoadOp<wgpu::Color> = wgpu::LoadOp::Clear(wgpu::Color {
+    r: 0.0,
+    g: 0.0,
+    b: 0.0,
+    a: 1.0,
+});
+
 pub(crate) const CLEAR: wgpu::LoadOp<wgpu::Color> = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
 
 pub(crate) fn draw_fullscreen(
@@ -248,7 +283,19 @@ fn create_layouts(device: &wgpu::Device) -> Layouts {
 
     let mut composite = vec![texture; 1 + LAYERS_PER_PASS];
     composite.push(uniform(true));
+    let mut grade = vec![texture; 11];
+    grade.extend([
+        uniform(false),
+        wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+    ]);
     Layouts {
+        grade: layout("grade", &grade),
+        apply_mask: layout("apply mask", &[texture, texture]),
+        copy_tile: layout("copy tile", &[texture, uniform(false)]),
         image: layout("image", &[texture, uniform(false)]),
         resample: layout("resample", &[texture, uniform(false)]),
         export: layout("export", &[texture, uniform(false)]),
@@ -285,6 +332,10 @@ fn create_pipelines(
             vertex: "import_vertex",
             ..fullscreen("import_fragment", TILE_FORMAT, &layouts.image)
         }),
+        import_mask: build(PipelineSpec {
+            vertex: "import_vertex",
+            ..fullscreen("import_mask_fragment", TILE_FORMAT, &layouts.image)
+        }),
         export: build(fullscreen("export_fragment", IMAGE_FORMAT, &layouts.export)),
         resample: build(fullscreen(
             "resample_fragment",
@@ -309,6 +360,22 @@ fn create_pipelines(
             topology: wgpu::PrimitiveTopology::TriangleStrip,
         }),
         stroke: build(fullscreen("stroke_fragment", TILE_FORMAT, &layouts.stroke)),
+        mask_stroke: build(fullscreen(
+            "mask_stroke_fragment",
+            TILE_FORMAT,
+            &layouts.stroke,
+        )),
+        apply_mask: build(fullscreen(
+            "apply_mask_fragment",
+            TILE_FORMAT,
+            &layouts.apply_mask,
+        )),
+        grade: build(fullscreen("grade_fragment", TILE_FORMAT, &layouts.grade)),
+        copy_tile: build(fullscreen(
+            "copy_tile_fragment",
+            TILE_FORMAT,
+            &layouts.copy_tile,
+        )),
         composite: build(fullscreen(
             "composite_fragment",
             TILE_FORMAT,

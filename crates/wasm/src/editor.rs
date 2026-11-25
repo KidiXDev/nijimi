@@ -220,6 +220,31 @@ impl Editor {
             .map_err(JsError::from)?)
     }
 
+    #[wasm_bindgen(js_name = importCubeLut)]
+    pub fn import_cube_lut(
+        &mut self,
+        text: &str,
+        #[wasm_bindgen(unchecked_optional_param_type = "LayerPlacement")] options: Option<JsValue>,
+    ) -> Result<LayerId, JsValue> {
+        let options: ImportOptions = options
+            .as_ref()
+            .map(from_js)
+            .transpose()?
+            .unwrap_or_default();
+        let place = options.place();
+        Ok(self
+            .session
+            .borrow_mut()
+            .engine
+            .import_cube_lut(text, options.name, place)
+            .map_err(JsError::from)?)
+    }
+
+    #[wasm_bindgen(js_name = setCubeLut)]
+    pub fn set_cube_lut(&mut self, id: LayerId, text: &str) -> Result<(), JsError> {
+        Ok(self.session.borrow_mut().engine.set_cube_lut(id, text)?)
+    }
+
     #[wasm_bindgen(js_name = setHistoryLimit)]
     pub fn set_history_limit(&mut self, bytes: f64) {
         self.session
@@ -313,6 +338,27 @@ impl Editor {
                 .map_err(|error| JsError::from(error).into())
         });
         export_pixels_js(readback, alpha)
+    }
+
+    #[wasm_bindgen(js_name = setMaskAlpha)]
+    pub fn set_mask_alpha(&mut self, id: LayerId, alpha: &[u8]) -> Result<(), JsError> {
+        Ok(self.session.borrow_mut().engine.set_mask_alpha(id, alpha)?)
+    }
+
+    #[wasm_bindgen(js_name = exportMask, unchecked_return_type = "Promise<Uint8Array>")]
+    pub fn export_mask(
+        &mut self,
+        id: LayerId,
+        #[wasm_bindgen(unchecked_optional_param_type = "PixelRect")] rect: Option<JsValue>,
+    ) -> Promise {
+        let readback = optional_rect(rect).and_then(|rect| {
+            self.session
+                .borrow_mut()
+                .engine
+                .read_mask(id, rect)
+                .map_err(|error| JsError::from(error).into())
+        });
+        export_pixels_js(readback, true)
     }
 
     #[wasm_bindgen(unchecked_return_type = "Promise<Histogram>")]
@@ -454,6 +500,23 @@ impl Editor {
         Ok(session
             .engine
             .begin_brush_stroke(brush, dynamics, erase, point)?)
+    }
+
+    #[wasm_bindgen(js_name = beginMaskStroke)]
+    pub fn begin_mask_stroke(
+        &mut self,
+        id: LayerId,
+        value: f32,
+        x: f32,
+        y: f32,
+        pressure: f32,
+    ) -> Result<(), JsError> {
+        let mut session = self.session.borrow_mut();
+        let (brush, dynamics) = (session.brush, session.dynamics);
+        let point = session.stroke_point(x, y, pressure);
+        Ok(session
+            .engine
+            .begin_mask_stroke(id, brush, dynamics, value, point)?)
     }
 
     #[wasm_bindgen(js_name = extendStroke)]

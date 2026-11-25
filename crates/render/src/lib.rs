@@ -4,6 +4,7 @@ mod error;
 mod fill;
 mod geometry;
 mod gpu;
+mod grade;
 mod project;
 mod readback;
 mod stroke;

@@ -2,20 +2,23 @@ use std::{
     error::Error,
     fmt,
     io::{self, Cursor, Read, Write},
+    sync::Arc,
 };
 
 use serde::{Deserialize, Serialize};
 use zip::{ZipArchive, ZipWriter, result::ZipError, write::SimpleFileOptions};
 
 use crate::{
-    Document, DocumentError, Layer, LayerContent, LayerId, LayerProperties, MAX_LAYERS, TILE_BYTES,
-    TileCoord, Tiles,
+    Adjustment, CubeLut, Document, DocumentError, Layer, LayerContent, LayerId, LayerMask,
+    LayerProperties, LutInfo, MAX_LAYERS, TILE_BYTES, TileCoord, Tiles,
 };
 
 pub const MAX_PROJECT_TILES: usize = 32_768;
 
 const FORMAT: &str = "nijimi";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+const MAX_LUT_BYTES: usize = 128 * 1024 * 1024;
+type Archive = ZipArchive<Cursor<Vec<u8>>>;
 const MANIFEST: &str = "manifest.json";
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const FASTEST_COMPRESSION: i64 = 1;
@@ -112,6 +115,14 @@ struct ManifestLayer {
     properties: LayerProperties,
     #[serde(flatten)]
     content: ManifestContent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mask: Option<ManifestMask>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ManifestMask {
+    reveal: bool,
+    tiles: Vec<TileCoord>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -119,11 +130,14 @@ struct ManifestLayer {
 enum ManifestContent {
     Raster { tiles: Vec<TileCoord> },
     Group { layers: Vec<ManifestLayer> },
+    Adjustment { adjustment: Adjustment },
+    Lut { table: LutInfo },
 }
 
 pub struct ProjectWriter {
     archive: ZipWriter<Cursor<Vec<u8>>>,
     tile_count: usize,
+    lut_bytes: usize,
 }
 
 impl Default for ProjectWriter {
@@ -131,6 +145,7 @@ impl Default for ProjectWriter {
         Self {
             archive: ZipWriter::new(Cursor::new(Vec::new())),
             tile_count: 0,
+            lut_bytes: 0,
         }
     }
 }
@@ -142,11 +157,30 @@ impl ProjectWriter {
         coord: TileCoord,
         pixels: &[u8],
     ) -> Result<(), ProjectError> {
+        self.add_plane_tile(layer, coord, false, pixels)
+    }
+
+    pub fn add_mask_tile(
+        &mut self,
+        layer: LayerId,
+        coord: TileCoord,
+        pixels: &[u8],
+    ) -> Result<(), ProjectError> {
+        self.add_plane_tile(layer, coord, true, pixels)
+    }
+
+    fn add_plane_tile(
+        &mut self,
+        layer: LayerId,
+        coord: TileCoord,
+        mask: bool,
+        pixels: &[u8],
+    ) -> Result<(), ProjectError> {
         if self.tile_count == MAX_PROJECT_TILES {
             return Err(ProjectError::TooManyTiles);
         }
         self.tile_count += 1;
-        self.write_entry(tile_path(layer, coord), pixels)
+        self.write_entry(tile_path(layer, coord, mask), pixels)
     }
 
     pub fn finish<T>(
@@ -161,10 +195,16 @@ impl ProjectWriter {
             width,
             height,
             active_layer,
-            layers: layers.iter().map(manifest_layer).collect(),
+            layers: layers
+                .iter()
+                .map(|layer| self.manifest_layer(layer))
+                .collect::<Result<_, _>>()?,
         };
         let json = serde_json::to_vec(&manifest)
             .map_err(|error| ProjectError::InvalidManifest(error.to_string()))?;
+        if json.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err(ProjectError::InvalidManifest("it is too large".into()));
+        }
         self.write_entry(MANIFEST.into(), &json)?;
         Ok(self.archive.finish()?.into_inner())
     }
@@ -175,25 +215,52 @@ impl ProjectWriter {
         self.archive.write_all(content)?;
         Ok(())
     }
-}
 
-fn manifest_layer<T>(layer: &Layer<T>) -> ManifestLayer {
-    ManifestLayer {
-        id: layer.id,
-        properties: layer.properties.clone(),
-        content: match &layer.content {
+    fn manifest_layer<T>(&mut self, layer: &Layer<T>) -> Result<ManifestLayer, ProjectError> {
+        let content = match &layer.content {
             LayerContent::Raster(tiles) => ManifestContent::Raster {
                 tiles: tiles.keys().copied().collect(),
             },
             LayerContent::Group(children) => ManifestContent::Group {
-                layers: children.iter().map(manifest_layer).collect(),
+                layers: children
+                    .iter()
+                    .map(|child| self.manifest_layer(child))
+                    .collect::<Result<_, _>>()?,
             },
-        },
+            LayerContent::Adjustment(Adjustment::Lut { table }) => {
+                self.lut_bytes += size_of_val(table.samples.as_slice());
+                if self.lut_bytes > MAX_LUT_BYTES || !table.is_valid() {
+                    return Err(invalid_lut(layer.id));
+                }
+                let bytes: Vec<_> = table
+                    .samples
+                    .iter()
+                    .flatten()
+                    .flat_map(|sample| sample.to_le_bytes())
+                    .collect();
+                self.write_entry(lut_path(layer.id), &bytes)?;
+                ManifestContent::Lut {
+                    table: table.info.clone(),
+                }
+            }
+            LayerContent::Adjustment(adjustment) => ManifestContent::Adjustment {
+                adjustment: adjustment.clone(),
+            },
+        };
+        Ok(ManifestLayer {
+            id: layer.id,
+            properties: layer.properties.clone(),
+            mask: layer.mask.as_ref().map(|mask| ManifestMask {
+                reveal: mask.reveal,
+                tiles: mask.tiles.keys().copied().collect(),
+            }),
+            content,
+        })
     }
 }
 
 pub struct ProjectReader {
-    archive: ZipArchive<Cursor<Vec<u8>>>,
+    archive: Archive,
     document: Document<()>,
 }
 
@@ -228,7 +295,7 @@ impl ProjectReader {
         let layers = manifest
             .layers
             .into_iter()
-            .map(|layer| limits.accept(layer))
+            .map(|layer| limits.accept(layer, &mut archive))
             .collect::<Result<_, _>>()?;
         let document = Document::with_layers(
             (manifest.width, manifest.height),
@@ -243,10 +310,27 @@ impl ProjectReader {
     }
 
     pub fn read_tile(&mut self, layer: LayerId, coord: TileCoord) -> Result<Vec<u8>, ProjectError> {
+        self.read_plane_tile(layer, coord, false)
+    }
+
+    pub fn read_mask_tile(
+        &mut self,
+        layer: LayerId,
+        coord: TileCoord,
+    ) -> Result<Vec<u8>, ProjectError> {
+        self.read_plane_tile(layer, coord, true)
+    }
+
+    fn read_plane_tile(
+        &mut self,
+        layer: LayerId,
+        coord: TileCoord,
+        mask: bool,
+    ) -> Result<Vec<u8>, ProjectError> {
         let invalid = || ProjectError::InvalidTile { layer, coord };
         let entry = self
             .archive
-            .by_name(&tile_path(layer, coord))
+            .by_name(&tile_path(layer, coord, mask))
             .map_err(|_| invalid())?;
         if entry.size() != TILE_BYTES as u64 {
             return Err(invalid());
@@ -267,41 +351,111 @@ impl ProjectReader {
 struct Limits {
     layers: usize,
     tiles: usize,
+    lut_bytes: usize,
 }
 
 impl Limits {
-    fn accept(&mut self, layer: ManifestLayer) -> Result<Layer<()>, ProjectError> {
+    fn accept(
+        &mut self,
+        layer: ManifestLayer,
+        archive: &mut Archive,
+    ) -> Result<Layer<()>, ProjectError> {
         self.layers += 1;
         if self.layers > MAX_LAYERS {
             return Err(DocumentError::TooManyLayers.into());
         }
         let id = layer.id;
         let content = match layer.content {
-            ManifestContent::Raster { tiles: coords } => {
-                self.tiles += coords.len();
-                if self.tiles > MAX_PROJECT_TILES {
-                    return Err(ProjectError::TooManyTiles);
-                }
-                let mut tiles = Tiles::new();
-                for coord in coords {
-                    if tiles.insert(coord, ()).is_some() {
-                        return Err(ProjectError::DuplicateTile { layer: id, coord });
-                    }
-                }
-                LayerContent::Raster(tiles)
+            ManifestContent::Raster { tiles } => {
+                LayerContent::Raster(self.accept_tiles(id, tiles)?)
             }
             ManifestContent::Group { layers } => LayerContent::Group(
                 layers
                     .into_iter()
-                    .map(|layer| self.accept(layer))
+                    .map(|layer| self.accept(layer, archive))
                     .collect::<Result<_, _>>()?,
             ),
+            ManifestContent::Adjustment { adjustment } => {
+                if matches!(adjustment, Adjustment::Lut { .. }) {
+                    return Err(invalid_lut(id));
+                }
+                LayerContent::Adjustment(adjustment)
+            }
+            ManifestContent::Lut { table } => {
+                let lut = self.read_lut(id, table, archive)?;
+                LayerContent::Adjustment(Adjustment::Lut {
+                    table: Arc::new(lut),
+                })
+            }
         };
+        let mask = layer
+            .mask
+            .map(|mask| {
+                self.accept_tiles(id, mask.tiles).map(|tiles| LayerMask {
+                    reveal: mask.reveal,
+                    tiles,
+                })
+            })
+            .transpose()?;
         Ok(Layer {
             id,
             properties: layer.properties,
             content,
+            mask,
         })
+    }
+
+    fn accept_tiles(
+        &mut self,
+        id: LayerId,
+        coords: Vec<TileCoord>,
+    ) -> Result<Tiles<()>, ProjectError> {
+        self.tiles += coords.len();
+        if self.tiles > MAX_PROJECT_TILES {
+            return Err(ProjectError::TooManyTiles);
+        }
+        let mut tiles = Tiles::new();
+        for coord in coords {
+            if tiles.insert(coord, ()).is_some() {
+                return Err(ProjectError::DuplicateTile { layer: id, coord });
+            }
+        }
+        Ok(tiles)
+    }
+
+    fn read_lut(
+        &mut self,
+        id: LayerId,
+        info: LutInfo,
+        archive: &mut Archive,
+    ) -> Result<CubeLut, ProjectError> {
+        let length = info.sample_count().ok_or_else(|| invalid_lut(id))? * 12;
+        self.lut_bytes += length;
+        if self.lut_bytes > MAX_LUT_BYTES {
+            return Err(invalid_lut(id));
+        }
+        let entry = archive
+            .by_name(&lut_path(id))
+            .map_err(|_| invalid_lut(id))?;
+        if entry.size() != length as u64 {
+            return Err(invalid_lut(id));
+        }
+        let mut bytes = Vec::with_capacity(length);
+        entry.take(length as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() != length {
+            return Err(invalid_lut(id));
+        }
+        let samples = bytes
+            .as_chunks::<12>()
+            .0
+            .iter()
+            .map(|row| std::array::from_fn(|i| f32::from_le_bytes(row.as_chunks::<4>().0[i])))
+            .collect();
+        let table = CubeLut { info, samples };
+        table
+            .is_valid()
+            .then_some(table)
+            .ok_or_else(|| invalid_lut(id))
     }
 }
 
@@ -309,8 +463,19 @@ fn parse<'a, T: Deserialize<'a>>(json: &'a [u8]) -> Result<T, ProjectError> {
     serde_json::from_slice(json).map_err(|error| ProjectError::InvalidManifest(error.to_string()))
 }
 
-fn tile_path(layer: LayerId, TileCoord { x, y }: TileCoord) -> String {
-    format!("tiles/{layer}/{x}_{y}")
+fn tile_path(layer: LayerId, TileCoord { x, y }: TileCoord, mask: bool) -> String {
+    let plane = if mask { "masks" } else { "tiles" };
+    format!("{plane}/{layer}/{x}_{y}")
+}
+
+fn lut_path(id: LayerId) -> String {
+    format!("luts/{id}.bin")
+}
+
+fn invalid_lut(id: LayerId) -> ProjectError {
+    ProjectError::InvalidManifest(format!(
+        "the LUT for layer {id} is invalid or exceeds project limits"
+    ))
 }
 
 fn has_valid_channels(pixels: &[u8]) -> bool {

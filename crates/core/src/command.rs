@@ -1,6 +1,8 @@
 use serde::{Deserialize, Deserializer};
 
-use crate::{BlendMode, Brush, BrushDynamics, LayerId, PixelRect, StrokePoint, Transform};
+use crate::{
+    Adjustment, BlendMode, Brush, BrushDynamics, LayerId, PixelRect, StrokePoint, Transform,
+};
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(
@@ -20,6 +22,33 @@ pub enum Command {
         #[serde(default, deserialize_with = "present")]
         parent: Option<Option<LayerId>>,
         index: Option<usize>,
+    },
+    AddAdjustment {
+        name: Option<String>,
+        #[serde(default, deserialize_with = "present")]
+        parent: Option<Option<LayerId>>,
+        index: Option<usize>,
+        adjustment: Adjustment,
+    },
+    SetAdjustment {
+        id: LayerId,
+        adjustment: Adjustment,
+    },
+    AddMask {
+        id: LayerId,
+        #[serde(default = "reveal")]
+        reveal: bool,
+    },
+    RemoveMask {
+        id: LayerId,
+    },
+    PaintMaskStroke {
+        id: LayerId,
+        value: f32,
+        brush: Brush,
+        points: Vec<StrokePoint>,
+        #[serde(default)]
+        dynamics: BrushDynamics,
     },
     DeleteLayer {
         id: LayerId,
@@ -89,6 +118,10 @@ pub enum Command {
     },
     Undo,
     Redo,
+}
+
+fn reveal() -> bool {
+    true
 }
 
 fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(

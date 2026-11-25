@@ -36,12 +36,18 @@ impl ProjectSnapshot {
                 Readback::record_tiles(
                     &self.gpu.device,
                     encoder,
-                    batch.iter().map(|(_, _, tile)| tile.as_ref()),
+                    batch.iter().map(|(_, _, _, tile)| tile.as_ref()),
                 )
             });
             let pixels = readback.pixels().await?;
-            for ((layer, coord, _), pixels) in batch.iter().zip(pixels.chunks_exact(TILE_BYTES)) {
-                writer.add_tile(*layer, *coord, pixels)?;
+            for ((layer, coord, mask, _), pixels) in
+                batch.iter().zip(pixels.chunks_exact(TILE_BYTES))
+            {
+                if *mask {
+                    writer.add_mask_tile(*layer, *coord, pixels)?;
+                } else {
+                    writer.add_tile(*layer, *coord, pixels)?;
+                }
             }
         }
         Ok(writer.finish(self.size, &self.layers, self.active)?)
@@ -77,7 +83,13 @@ impl ProjectLoader {
         for batch in tile_list(reader.document().layers()).chunks(TILES_PER_LOAD_BATCH) {
             let pixels = batch
                 .iter()
-                .map(|(layer, coord, ())| reader.read_tile(*layer, *coord))
+                .map(|(layer, coord, mask, ())| {
+                    if *mask {
+                        reader.read_mask_tile(*layer, *coord)
+                    } else {
+                        reader.read_tile(*layer, *coord)
+                    }
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let tiles = gpu
                 .catch_errors(|| {
@@ -93,7 +105,7 @@ impl ProjectLoader {
                 batch
                     .iter()
                     .zip(tiles)
-                    .map(|((layer, coord, ()), tile)| ((*layer, *coord), tile)),
+                    .map(|((layer, coord, mask, ()), tile)| ((*layer, *coord, *mask), tile)),
             );
         }
 
@@ -101,7 +113,9 @@ impl ProjectLoader {
             .document()
             .layers()
             .iter()
-            .map(|layer| layer.map_tiles(&mut |id, coord, ()| uploaded[&(id, coord)].clone()))
+            .map(|layer| {
+                layer.map_planes(&mut |id, coord, mask, ()| uploaded[&(id, coord, mask)].clone())
+            })
             .collect();
         let document = Document::with_layers(size, layers, reader.document().active())?;
         Ok(LoadedProject {
@@ -111,12 +125,19 @@ impl ProjectLoader {
     }
 }
 
-fn tile_list<T: Clone>(layers: &[Layer<T>]) -> Vec<(LayerId, TileCoord, T)> {
+fn tile_list<T: Clone>(layers: &[Layer<T>]) -> Vec<(LayerId, TileCoord, bool, T)> {
     let mut list = Vec::new();
     for layer in layers {
         layer.visit(&mut |layer| {
             let tiles = layer.tiles().into_iter().flat_map(Tiles::iter);
-            list.extend(tiles.map(|(coord, tile)| (layer.id, *coord, tile.clone())));
+            list.extend(tiles.map(|(coord, tile)| (layer.id, *coord, false, tile.clone())));
+            if let Some(mask) = &layer.mask {
+                list.extend(
+                    mask.tiles
+                        .iter()
+                        .map(|(coord, tile)| (layer.id, *coord, true, tile.clone())),
+                );
+            }
         });
     }
     list

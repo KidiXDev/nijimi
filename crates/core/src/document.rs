@@ -1,8 +1,8 @@
 use std::{collections::BTreeSet, error::Error, fmt, mem};
 
 use crate::{
-    BlendMode, DEFAULT_HISTORY_LIMIT, Event, Layer, LayerContent, LayerId, LayerProperties,
-    MAX_NAME_LENGTH, RasterEdit, TileCoord, Tiles, find_layer,
+    Adjustment, BlendMode, DEFAULT_HISTORY_LIMIT, Event, Layer, LayerContent, LayerId, LayerMask,
+    LayerProperties, MAX_NAME_LENGTH, RasterEdit, TileCoord, Tiles, find_layer,
     history::{Edit, Entry, History},
 };
 
@@ -14,6 +14,10 @@ pub enum DocumentError {
     LayerNotFound(LayerId),
     NotAGroup(LayerId),
     NotARasterLayer(LayerId),
+    NotAnAdjustment(LayerId),
+    NoMask(LayerId),
+    MaskExists(LayerId),
+    InvalidAdjustment,
     MoveIntoItself,
     TooManyLayers,
     TooDeep,
@@ -30,7 +34,15 @@ impl fmt::Display for DocumentError {
         match self {
             Self::LayerNotFound(id) => write!(formatter, "Layer {id} does not exist."),
             Self::NotAGroup(id) => write!(formatter, "Layer {id} is not a group."),
-            Self::NotARasterLayer(id) => write!(formatter, "Layer {id} is a group."),
+            Self::NotARasterLayer(id) => write!(formatter, "Layer {id} has no raster pixels."),
+            Self::NotAnAdjustment(id) => {
+                write!(formatter, "Layer {id} is not an adjustment layer.")
+            }
+            Self::NoMask(id) => write!(formatter, "Layer {id} has no mask."),
+            Self::MaskExists(id) => write!(formatter, "Layer {id} already has a mask."),
+            Self::InvalidAdjustment => {
+                write!(formatter, "An adjustment parameter is out of range.")
+            }
             Self::MoveIntoItself => write!(formatter, "A group cannot be moved into itself."),
             Self::TooManyLayers => {
                 write!(
@@ -234,6 +246,72 @@ impl<T: Clone> Document<T> {
         self.insert(group, place)
     }
 
+    pub fn add_adjustment(
+        &mut self,
+        name: Option<String>,
+        place: Option<LayerPlace>,
+        adjustment: Adjustment,
+    ) -> Result<LayerId, DocumentError> {
+        if !adjustment.is_valid() {
+            return Err(DocumentError::InvalidAdjustment);
+        }
+        let name = name.unwrap_or_else(|| format!("Adjustment {}", self.next_id));
+        self.insert(Layer::adjustment(self.next_id, name, adjustment), place)
+    }
+
+    pub fn set_adjustment(
+        &mut self,
+        id: LayerId,
+        adjustment: Adjustment,
+    ) -> Result<(), DocumentError> {
+        let previous = self
+            .layer(id)?
+            .grade()
+            .ok_or(DocumentError::NotAnAdjustment(id))?;
+        if !adjustment.is_valid() {
+            return Err(DocumentError::InvalidAdjustment);
+        }
+        if *previous != adjustment {
+            self.observed(|document| document.commit(Edit::Adjustment { id, adjustment }));
+        }
+        Ok(())
+    }
+
+    pub fn add_mask(&mut self, id: LayerId, reveal: bool) -> Result<(), DocumentError> {
+        if self.layer(id)?.mask.is_some() {
+            return Err(DocumentError::MaskExists(id));
+        }
+        self.replace_mask(
+            id,
+            LayerMask {
+                reveal,
+                tiles: Tiles::new(),
+            },
+        )
+    }
+
+    pub fn replace_mask(&mut self, id: LayerId, mask: LayerMask<T>) -> Result<(), DocumentError> {
+        self.layer(id)?;
+        if let Some(coord) = mask.tiles.keys().find(|coord| !coord.is_inside(self.size)) {
+            return Err(DocumentError::TileOutOfBounds(*coord));
+        }
+        self.observed(|document| {
+            document.commit(Edit::Mask {
+                id,
+                mask: Some(mask),
+            })
+        });
+        Ok(())
+    }
+
+    pub fn remove_mask(&mut self, id: LayerId) -> Result<(), DocumentError> {
+        if self.layer(id)?.mask.is_none() {
+            return Err(DocumentError::NoMask(id));
+        }
+        self.observed(|document| document.commit(Edit::Mask { id, mask: None }));
+        Ok(())
+    }
+
     pub fn delete_layer(&mut self, id: LayerId) -> Result<(), DocumentError> {
         let (parent, index) = self.position(id)?;
         let active_is_deleted = self
@@ -313,17 +391,57 @@ impl<T: Clone> Document<T> {
     pub fn replace_rasters(
         &mut self,
         size: (u32, u32),
-        mut layers: Vec<RasterEdit<T>>,
+        layers: Vec<RasterEdit<T>>,
+    ) -> Result<(), DocumentError> {
+        self.replace_planes(size, layers, Vec::new())
+    }
+
+    pub fn replace_mask_tiles(
+        &mut self,
+        id: LayerId,
+        tiles: Vec<(TileCoord, Option<T>)>,
+    ) -> Result<(), DocumentError> {
+        self.replace_planes(self.size, Vec::new(), vec![(id, tiles)])
+    }
+
+    pub fn replace_planes(
+        &mut self,
+        size: (u32, u32),
+        mut rasters: Vec<RasterEdit<T>>,
+        mut masks: Vec<RasterEdit<T>>,
     ) -> Result<(), DocumentError> {
         if size.0 == 0 || size.1 == 0 {
             return Err(DocumentError::InvalidSize);
         }
+        self.validate_plane_edits(size, &mut rasters, false)?;
+        self.validate_plane_edits(size, &mut masks, true)?;
+        if self.size != size || !rasters.is_empty() || !masks.is_empty() {
+            self.observed(|document| {
+                document.commit(Edit::Pixels {
+                    size,
+                    rasters,
+                    masks,
+                })
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_plane_edits(
+        &self,
+        size: (u32, u32),
+        layers: &mut Vec<RasterEdit<T>>,
+        mask: bool,
+    ) -> Result<(), DocumentError> {
+        let shrinking = size.0 < self.size.0 || size.1 < self.size.1;
         let mut touched = BTreeSet::new();
-        for (id, tiles) in &mut layers {
-            let current = self
-                .layer(*id)?
-                .tiles()
-                .ok_or(DocumentError::NotARasterLayer(*id))?;
+        for (id, tiles) in layers.iter_mut() {
+            let layer = self.layer(*id)?;
+            let current = if mask {
+                &layer.mask.as_ref().ok_or(DocumentError::NoMask(*id))?.tiles
+            } else {
+                layer.tiles().ok_or(DocumentError::NotARasterLayer(*id))?
+            };
             if !touched.insert(*id) {
                 return Err(DocumentError::DuplicateTileEdit(*id));
             }
@@ -337,7 +455,7 @@ impl<T: Clone> Document<T> {
                     return Err(DocumentError::TileOutOfBounds(*coord));
                 }
             }
-            if size.0 < self.size.0 || size.1 < self.size.1 {
+            if shrinking {
                 tiles.extend(
                     current
                         .keys()
@@ -346,11 +464,16 @@ impl<T: Clone> Document<T> {
                 );
             }
         }
-        if size.0 < self.size.0 || size.1 < self.size.1 {
+        if shrinking {
             for layer in &self.layers {
                 layer.visit(&mut |layer| {
+                    let plane = if mask {
+                        layer.mask.as_ref().map(|mask| &mask.tiles)
+                    } else {
+                        layer.tiles()
+                    };
                     if !touched.contains(&layer.id)
-                        && let Some(tiles) = layer.tiles()
+                        && let Some(tiles) = plane
                     {
                         layers.push((
                             layer.id,
@@ -365,9 +488,6 @@ impl<T: Clone> Document<T> {
             }
         }
         layers.retain(|(_, tiles)| !tiles.is_empty());
-        if self.size != size || !layers.is_empty() {
-            self.observed(|document| document.commit(Edit::Rasters { size, layers }));
-        }
         Ok(())
     }
 
@@ -509,8 +629,12 @@ impl<T: Clone> Document<T> {
                 let layer = self.layer_mut(id);
                 let previous = mem::replace(&mut layer.properties, properties);
                 if previous.appearance() != layer.properties.appearance() {
+                    let all = layer.has_adjustments();
                     let coords = tile_coords(layer);
                     self.mark_dirty(coords);
+                    if all {
+                        self.dirty.extend(TileCoord::all(self.size));
+                    }
                 }
                 self.events.push(Event::LayerChanged { id });
                 Edit::Properties {
@@ -518,34 +642,14 @@ impl<T: Clone> Document<T> {
                     properties: previous,
                 }
             }
-            Edit::Rasters { size, layers } => {
+            Edit::Pixels {
+                size,
+                rasters,
+                masks,
+            } => {
                 let old_size = mem::replace(&mut self.size, size);
-                let layers = layers
-                    .into_iter()
-                    .map(|(id, tiles)| {
-                        self.mark_dirty(
-                            tiles
-                                .iter()
-                                .map(|(coord, _)| *coord)
-                                .filter(|coord| coord.is_inside(size)),
-                        );
-                        let LayerContent::Raster(current) = &mut self.layer_mut(id).content else {
-                            unreachable!("tile edits are only recorded for raster layers");
-                        };
-                        let previous = tiles
-                            .into_iter()
-                            .map(|(coord, tile)| {
-                                let previous = match tile {
-                                    Some(tile) => current.insert(coord, tile),
-                                    None => current.remove(&coord),
-                                };
-                                (coord, previous)
-                            })
-                            .collect();
-                        self.events.push(Event::PixelsChanged { id });
-                        (id, previous)
-                    })
-                    .collect();
+                let rasters = self.swap_plane(rasters, false);
+                let masks = self.swap_plane(masks, true);
                 if old_size != size {
                     self.dirty.retain(|coord| coord.is_inside(size));
                     self.mark_all_dirty();
@@ -554,16 +658,89 @@ impl<T: Clone> Document<T> {
                         height: size.1,
                     });
                 }
-                Edit::Rasters {
+                Edit::Pixels {
                     size: old_size,
-                    layers,
+                    rasters,
+                    masks,
+                }
+            }
+            Edit::Mask { id, mask } => {
+                let layer = self.layer_mut(id);
+                let previous = mem::replace(&mut layer.mask, mask);
+                let all = layer.has_adjustments();
+                let coords = tile_coords(layer);
+                self.mark_dirty(coords);
+                if all {
+                    self.dirty.extend(TileCoord::all(self.size));
+                }
+                self.events.push(Event::LayerChanged { id });
+                Edit::Mask { id, mask: previous }
+            }
+            Edit::Adjustment { id, adjustment } => {
+                let LayerContent::Adjustment(current) = &mut self.layer_mut(id).content else {
+                    unreachable!("adjustment layer checked before applying edit");
+                };
+                let previous = mem::replace(current, adjustment);
+                self.dirty.extend(TileCoord::all(self.size));
+                self.events.push(Event::LayerChanged { id });
+                Edit::Adjustment {
+                    id,
+                    adjustment: previous,
                 }
             }
         }
     }
 
+    fn swap_plane(&mut self, layers: Vec<RasterEdit<T>>, mask: bool) -> Vec<RasterEdit<T>> {
+        layers
+            .into_iter()
+            .map(|(id, tiles)| {
+                let size = self.size;
+                self.mark_dirty(
+                    tiles
+                        .iter()
+                        .map(|(coord, _)| *coord)
+                        .filter(|coord| coord.is_inside(size)),
+                );
+                let layer = self.layer_mut(id);
+                let current = if mask {
+                    &mut layer
+                        .mask
+                        .as_mut()
+                        .expect("mask checked before applying edit")
+                        .tiles
+                } else {
+                    let LayerContent::Raster(tiles) = &mut layer.content else {
+                        unreachable!("raster layer checked before applying edit");
+                    };
+                    tiles
+                };
+                let previous = tiles
+                    .into_iter()
+                    .map(|(coord, tile)| {
+                        let previous = match tile {
+                            Some(tile) => current.insert(coord, tile),
+                            None => current.remove(&coord),
+                        };
+                        (coord, previous)
+                    })
+                    .collect();
+                self.events.push(if mask {
+                    Event::MaskChanged { id }
+                } else {
+                    Event::PixelsChanged { id }
+                });
+                (id, previous)
+            })
+            .collect()
+    }
+
     fn mark_layer_dirty(&mut self, layer: &Layer<T>) {
-        self.mark_dirty(tile_coords(layer));
+        if layer.has_adjustments() {
+            self.dirty.extend(TileCoord::all(self.size));
+        } else {
+            self.mark_dirty(tile_coords(layer));
+        }
     }
 
     fn layer_count(&self) -> usize {
@@ -575,7 +752,7 @@ impl<T: Clone> Document<T> {
     }
 
     fn check_parent(&self, parent: LayerId, added_depth: usize) -> Result<(), DocumentError> {
-        if let LayerContent::Raster(_) = self.layer(parent)?.content {
+        if !matches!(self.layer(parent)?.content, LayerContent::Group(_)) {
             return Err(DocumentError::NotAGroup(parent));
         }
         let mut depth = added_depth;
@@ -615,7 +792,7 @@ impl<T: Clone> Document<T> {
         };
         match &mut self.layer_mut(id).content {
             LayerContent::Group(children) => children,
-            LayerContent::Raster(_) => unreachable!("parents are checked before edits"),
+            _ => unreachable!("parents are checked before edits"),
         }
     }
 
@@ -648,7 +825,7 @@ fn find_layer_mut<T>(layers: &mut [Layer<T>], id: LayerId) -> Option<&mut Layer<
         }
         match &mut layer.content {
             LayerContent::Group(children) => find_layer_mut(children, id),
-            LayerContent::Raster(_) => None,
+            _ => None,
         }
     })
 }
@@ -657,6 +834,7 @@ fn tile_coords<T>(layer: &Layer<T>) -> BTreeSet<TileCoord> {
     let mut coords = BTreeSet::new();
     layer.visit(&mut |layer| {
         coords.extend(layer.tiles().into_iter().flat_map(|tiles| tiles.keys()));
+        coords.extend(layer.mask.iter().flat_map(|mask| mask.tiles.keys()));
     });
     coords
 }
@@ -673,9 +851,18 @@ fn check_layer<T>(layer: &Layer<T>, size: (u32, u32)) -> Result<(), DocumentErro
     if !(0.0..=1.0).contains(&layer.properties.opacity) {
         return Err(DocumentError::InvalidOpacity);
     }
+    if layer
+        .grade()
+        .is_some_and(|adjustment| !adjustment.is_valid())
+    {
+        return Err(DocumentError::InvalidAdjustment);
+    }
     let outside = layer
         .tiles()
-        .and_then(|tiles| tiles.keys().find(|coord| !coord.is_inside(size)));
+        .into_iter()
+        .chain(layer.mask.iter().map(|mask| &mask.tiles))
+        .flat_map(Tiles::keys)
+        .find(|coord| !coord.is_inside(size));
     match outside {
         Some(coord) => Err(DocumentError::TileOutOfBounds(*coord)),
         None => Ok(()),
