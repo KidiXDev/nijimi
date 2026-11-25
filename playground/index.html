@@ -10,50 +10,152 @@
   </head>
   <body>
     <header>
-      <label>Open <input id="file" type="file" accept="image/*,.nijimi" /></label>
-      <button id="save" type="button">Save project</button>
-      <button id="export" type="button">Export PNG</button>
-      <button id="undo" type="button" disabled>Undo</button>
-      <button id="redo" type="button" disabled>Redo</button>
-      <button id="fit" type="button">Fit</button>
+      <h1>Nijimi</h1>
+      <label class="button" data-icon="open">
+        <span>Open</span>
+        <input id="file" type="file" accept="image/*,.nijimi" />
+      </label>
+      <button id="save" type="button" data-icon="save"><span>Save project</span></button>
+      <button id="export" type="button" data-icon="download"><span>Export PNG</span></button>
+      <div class="group">
+        <button id="undo" type="button" data-icon="undo" aria-label="Undo" title="Undo (Ctrl+Z)" disabled></button>
+        <button id="redo" type="button" data-icon="redo" aria-label="Redo" title="Redo (Ctrl+Y)" disabled></button>
+        <button id="fit" type="button" data-icon="fit" aria-label="Fit the image" title="Fit the image"></button>
+      </div>
       <button id="benchmark" type="button" title="Replaces the open document">Benchmark</button>
-      <label>Size <input id="size" type="range" min="1" max="1000" value="120" /></label>
-      <label>Hardness <input id="hardness" type="range" min="0" max="1" step="0.01" value="0.3" /></label>
-      <label>Flow <input id="flow" type="range" min="0.01" max="1" step="0.01" value="0.5" /></label>
-      <label>Opacity <input id="brush-opacity" type="range" min="0.01" max="1" step="0.01" value="1" /></label>
-      <label>Color <input id="color" type="color" value="#e0457b" /></label>
-      <output id="status">Starting…</output>
+      <button id="toggle-panel" type="button" data-icon="layers" aria-label="Layers" aria-expanded="false" aria-controls="panel"></button>
     </header>
+
+    <div id="options" role="toolbar" aria-label="Tool options">
+      <label class="field" data-tools="brush eraser clone heal smudge blur">
+        Size <input id="size" type="range" min="1" max="1000" value="120" /><output></output>
+      </label>
+      <label class="field" data-tools="brush eraser clone heal smudge blur">
+        Hardness <input id="hardness" type="range" min="0" max="1" step="0.01" value="0.3" /><output></output>
+      </label>
+      <label class="field" data-tools="brush eraser clone heal smudge blur">
+        Flow <input id="flow" type="range" min="0.01" max="1" step="0.01" value="0.5" /><output></output>
+      </label>
+      <label class="field" data-tools="brush eraser clone heal smudge blur">
+        Opacity <input id="brush-opacity" type="range" min="0.01" max="1" step="0.01" value="1" /><output></output>
+      </label>
+      <label class="field" data-tools="blur">
+        Radius <input id="blur-radius" type="range" min="1" max="32" value="8" /><output></output>
+      </label>
+      <label class="field" data-tools="brush fill text eyedropper">
+        Color <input id="color" type="color" value="#e0457b" />
+      </label>
+      <button id="set-source" type="button" data-tools="clone heal" aria-pressed="false">Set source</button>
+      <label class="field" data-tools="fill wand">
+        Tolerance <input id="tolerance" type="range" min="0" max="1" step="0.01" value="0.1" /><output></output>
+      </label>
+      <label class="field" data-tools="wand">
+        <input id="contiguous" type="checkbox" checked /> Connected pixels only
+      </label>
+      <label class="field" data-tools="rectangle ellipse lasso wand">
+        Mode
+        <select id="selection-mode">
+          <option value="replace">Replace</option>
+          <option value="add">Add (Shift)</option>
+          <option value="subtract">Subtract (Alt)</option>
+          <option value="intersect">Intersect (Shift+Alt)</option>
+        </select>
+      </label>
+      <div class="group" data-tools="rectangle ellipse lasso wand move">
+        <button id="select-all" type="button" title="Select all (Ctrl+A)">All</button>
+        <button id="deselect" type="button" title="Deselect (Ctrl+D)" data-needs-selection>None</button>
+        <button id="invert" type="button" title="Invert the selection (Ctrl+Shift+I)" data-needs-selection>Invert</button>
+        <button id="clear-selected" type="button" title="Clear the selected pixels (Delete)" data-needs-selection>Clear</button>
+      </div>
+      <label class="field" data-tools="rectangle ellipse lasso wand">
+        Edge <input id="edge-radius" type="range" min="1" max="100" value="10" /><output></output>
+      </label>
+      <div class="group" data-tools="rectangle ellipse lasso wand">
+        <button id="feather" type="button" title="Soften the edge of the selection" data-needs-selection>Feather</button>
+        <button id="grow" type="button" title="Grow the selection" data-needs-selection>Grow</button>
+        <button id="shrink" type="button" title="Shrink the selection" data-needs-selection>Shrink</button>
+      </div>
+      <p data-tools="move">Drag to move the active layer, or only its selected pixels.</p>
+      <p data-tools="text">Click the canvas to add text.</p>
+      <p data-tools="hand">Drag to pan. Scroll or pinch to zoom.</p>
+    </div>
+
     <main>
-      <canvas id="canvas" aria-label="Image canvas"></canvas>
-      <aside aria-label="Layers">
-        <div class="row">
-          <button id="add-layer" type="button">Add layer</button>
-          <button id="add-group" type="button">Add group</button>
+      <fieldset id="tools">
+        <legend>Tools</legend>
+      </fieldset>
+      <div id="stage">
+        <canvas id="canvas" aria-label="Image canvas"></canvas>
+        <svg id="overlay" aria-hidden="true"></svg>
+      </div>
+      <aside id="panel" aria-label="Layers">
+        <fieldset id="text-panel" hidden>
+          <legend>Text</legend>
+          <textarea id="text-content" rows="3" maxlength="10000" aria-label="Text"></textarea>
+          <label class="field">
+            Font
+            <select id="text-font">
+              <option value="system-ui, sans-serif">Sans serif</option>
+              <option value="Georgia, serif">Serif</option>
+              <option value="ui-monospace, monospace">Monospace</option>
+            </select>
+          </label>
+          <div class="row">
+            <label class="field">Size <input id="text-size" type="number" min="1" max="2000" /></label>
+            <label class="field">Color <input id="text-color" type="color" /></label>
+          </div>
+          <div class="row">
+            <label class="field"><input id="text-bold" type="checkbox" /> Bold</label>
+            <label class="field"><input id="text-italic" type="checkbox" /> Italic</label>
+            <select id="text-align" aria-label="Alignment">
+              <option value="left">Left</option>
+              <option value="center">Center</option>
+              <option value="right">Right</option>
+            </select>
+          </div>
+          <button id="rasterize" type="button" title="Turn the text into pixels so it can be painted on">Rasterize</button>
+        </fieldset>
+
+        <fieldset>
+          <legend>Layer</legend>
+          <label class="field">Name <input id="layer-name" type="text" maxlength="64" /></label>
+          <label class="field">
+            Blend
+            <select id="layer-blend">
+              <option value="normal">Normal</option>
+              <option value="multiply">Multiply</option>
+              <option value="screen">Screen</option>
+              <option value="overlay">Overlay</option>
+              <option value="softLight">Soft light</option>
+              <option value="add">Add</option>
+              <option value="darken">Darken</option>
+              <option value="lighten">Lighten</option>
+            </select>
+          </label>
+          <label class="field">
+            Opacity <input id="layer-opacity" type="range" min="0" max="1" step="0.01" />
+          </label>
+          <div class="row">
+            <button id="mask-from-selection" type="button" title="Show only the selected pixels of this layer" data-needs-selection>Mask selection</button>
+            <button id="select-mask" type="button" title="Select what the mask of this layer shows" disabled>Select mask</button>
+          </div>
+        </fieldset>
+
+        <ul id="layers" aria-label="Layers, top first"></ul>
+        <div class="group" role="toolbar" aria-label="Layer actions">
+          <button id="add-layer" type="button" data-icon="plus" aria-label="Add a layer" title="Add a layer"></button>
+          <button id="add-group" type="button" data-icon="group" aria-label="Add a group" title="Add a group"></button>
+          <button id="move-up" type="button" data-icon="up" aria-label="Move up" title="Move up"></button>
+          <button id="move-down" type="button" data-icon="down" aria-label="Move down" title="Move down"></button>
+          <button id="delete-layer" type="button" data-icon="trash" aria-label="Delete the layer" title="Delete the layer"></button>
         </div>
-        <div class="row">
-          <button id="move-up" type="button">Up</button>
-          <button id="move-down" type="button">Down</button>
-          <button id="delete-layer" type="button">Delete</button>
-        </div>
-        <label>Name <input id="layer-name" type="text" maxlength="64" /></label>
-        <label>
-          Blend
-          <select id="layer-blend">
-            <option value="normal">Normal</option>
-            <option value="multiply">Multiply</option>
-            <option value="screen">Screen</option>
-            <option value="overlay">Overlay</option>
-            <option value="softLight">Soft light</option>
-            <option value="add">Add</option>
-            <option value="darken">Darken</option>
-            <option value="lighten">Lighten</option>
-          </select>
-        </label>
-        <label>Opacity <input id="layer-opacity" type="range" min="0" max="1" step="0.01" /></label>
-        <ul id="layers"></ul>
       </aside>
     </main>
+
+    <footer>
+      <output id="view"></output>
+      <output id="status">Starting…</output>
+    </footer>
     <script type="module" src="./main.ts"></script>
   </body>
 </html>

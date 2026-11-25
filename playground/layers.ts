@@ -1,5 +1,5 @@
 import type { BlendMode, Command, EditorState, LayerState, PreviewCommand } from '../pkg/nijimi.js';
-import { element } from './dom';
+import { element, icon } from './dom';
 
 type Position = { parent: LayerState | null; siblings: LayerState[]; index: number };
 
@@ -58,6 +58,10 @@ export function createLayerPanel(
     return position && { state, position, layer: position.siblings[position.index] };
   }
 
+  function activeLayer() {
+    return active()?.layer ?? null;
+  }
+
   function moveActive(destination: typeof moveUp) {
     const current = active();
     const target = current && destination(current.state, current.position);
@@ -74,12 +78,18 @@ export function createLayerPanel(
     visible.addEventListener('change', () =>
       dispatch({ type: 'setLayerVisible', id: layer.id, visible: visible.checked })
     );
+    const toggle = document.createElement('label');
+    toggle.className = 'visibility';
+    toggle.append(visible, icon('eye'));
+    const name = document.createElement('span');
+    name.textContent = layer.name;
     const select = document.createElement('button');
     select.type = 'button';
-    select.textContent = layer.kind === 'group' ? `▾ ${layer.name}` : layer.name;
+    select.append(icon(layer.kind), name);
+    if (layer.mask) select.append(icon('mask'));
     select.ariaPressed = String(layer.id === activeLayer);
     select.addEventListener('click', () => dispatch({ type: 'selectLayer', id: layer.id }));
-    row.append(visible, select);
+    row.append(toggle, select);
     return row;
   }
 
@@ -116,8 +126,8 @@ export function createLayerPanel(
 
   function changeActive(event: string, control: HTMLElement, command: (id: number) => Command) {
     control.addEventListener(event, () => {
-      const current = active();
-      if (current) dispatch(command(current.layer.id));
+      const layer = activeLayer();
+      if (layer) dispatch(command(layer.id));
     });
   }
 
@@ -137,14 +147,11 @@ export function createLayerPanel(
     blendMode: blendSelect.value as BlendMode
   }));
   opacityInput.addEventListener('input', () => {
-    const current = active();
-    if (current) preview({
-      type: 'setLayerOpacity',
-      id: current.layer.id,
-      opacity: opacityInput.valueAsNumber
-    });
+    const layer = activeLayer();
+    const opacity = opacityInput.valueAsNumber;
+    if (layer) preview({ type: 'setLayerOpacity', id: layer.id, opacity });
   });
   opacityInput.addEventListener('change', commitPreview);
 
-  return { update };
+  return { update, activeLayer };
 }

@@ -1,26 +1,34 @@
 import init, { Editor, type Command, type EditorEvent } from '../pkg/nijimi.js';
 import { benchmark } from './benchmark';
-import { element } from './dom';
+import { element, fillIcons } from './dom';
+import { exportPng, openFile, saveProject } from './files';
+import { listenForGestures } from './gestures';
 import { createLayerPanel } from './layers';
+import { bindOptions, options } from './options';
+import { createOverlay } from './overlay';
+import { createTextPanel } from './text';
+import { createTools } from './tools';
 
 const DEFAULT_WIDTH = 3840;
 const DEFAULT_HEIGHT = 2160;
-const ZOOM_SPEED = 0.0015;
-const PROJECT_EXTENSION = '.nijimi';
 
 const canvas = element<HTMLCanvasElement>('canvas');
 const status = element<HTMLOutputElement>('status');
+const view = element<HTMLOutputElement>('view');
 const fileInput = element<HTMLInputElement>('file');
-const sizeInput = element<HTMLInputElement>('size');
-const hardnessInput = element<HTMLInputElement>('hardness');
-const flowInput = element<HTMLInputElement>('flow');
-const brushOpacityInput = element<HTMLInputElement>('brush-opacity');
-const colorInput = element<HTMLInputElement>('color');
 const undoButton = element<HTMLButtonElement>('undo');
 const redoButton = element<HTMLButtonElement>('redo');
+const panelToggle = element<HTMLButtonElement>('toggle-panel');
+const selectionButtons = document.querySelectorAll<HTMLButtonElement>('[data-needs-selection]');
+const maskSelectButton = element<HTMLButtonElement>('select-mask');
+
+function showMessage(message: string, isError = false) {
+  status.value = message;
+  status.classList.toggle('error', isError);
+}
 
 function showError(error: unknown) {
-  status.value = error instanceof Error ? error.message : String(error);
+  showMessage(error instanceof Error ? error.message : String(error), true);
 }
 
 function canvasPixels() {
@@ -31,67 +39,20 @@ function canvasPixels() {
   };
 }
 
-function canvasPoint(event: MouseEvent) {
-  const rect = canvas.getBoundingClientRect();
-  return {
-    x: (event.clientX - rect.left) * (canvas.width / rect.width),
-    y: (event.clientY - rect.top) * (canvas.height / rect.height)
-  };
-}
-
-function pressure(event: PointerEvent) {
-  return event.pointerType === 'pen' ? event.pressure : 1;
-}
-
-async function decodeRgba(file: File) {
-  const bitmap = await createImageBitmap(file);
-  const { width, height } = bitmap;
-  const context = new OffscreenCanvas(width, height).getContext('2d');
-  if (!context) throw new Error('2D canvas is unavailable');
-  context.drawImage(bitmap, 0, 0);
-  bitmap.close();
-  return context.getImageData(0, 0, width, height);
-}
-
-async function openFile(editor: Editor, file: File) {
-  if (file.name.toLowerCase().endsWith(PROJECT_EXTENSION)) {
-    await editor.loadProject(await file.bytes());
-    return;
-  }
-  const { width, height, data } = await decodeRgba(file);
-  editor.loadRgba(width, height, new Uint8Array(data.buffer));
-}
-
-function download(blob: Blob, name: string) {
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = name;
-  link.click();
-  URL.revokeObjectURL(url);
-}
-
-async function exportPng(editor: Editor) {
-  const { width, height } = editor;
-  const rgba = await editor.exportRgba();
-  const output = new OffscreenCanvas(width, height);
-  output
-    .getContext('2d')
-    ?.putImageData(new ImageData(new Uint8ClampedArray(rgba), width, height), 0, 0);
-  download(await output.convertToBlob(), 'nijimi.png');
-}
-
-async function saveProject(editor: Editor) {
-  const file = await editor.saveProject();
-  download(new Blob([new Uint8Array(file)]), `drawing${PROJECT_EXTENSION}`);
+function isEditingText(target: EventTarget | null) {
+  if (target instanceof HTMLInputElement) return ['text', 'number'].includes(target.type);
+  return target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement;
 }
 
 async function main() {
-  if (!navigator.gpu) throw new Error('WebGPU is unavailable in this browser');
+  if (!navigator.gpu) throw new Error('WebGPU is unavailable in this browser.');
+  fillIcons();
   await init();
   Object.assign(canvas, canvasPixels());
   const editor = await Editor.create(canvas, DEFAULT_WIDTH, DEFAULT_HEIGHT);
+  const overlay = createOverlay(element('overlay'), editor);
 
+  let autoFit = true;
   let renderQueued = false;
   function requestRender() {
     if (renderQueued) return;
@@ -100,7 +61,8 @@ async function main() {
       renderQueued = false;
       try {
         editor.render();
-        status.value = `${editor.width}×${editor.height} at ${Math.round(editor.zoom * 100)}%`;
+        tools.updateSource();
+        view.value = `${editor.width} × ${editor.height} at ${Math.round(editor.zoom * 100)}%`;
       } catch (error) {
         showError(error);
       }
@@ -111,14 +73,23 @@ async function main() {
     try {
       work();
       requestRender();
+      return true;
     } catch (error) {
       showError(error);
+      return false;
     }
   }
 
+  function run(work: () => Promise<void>) {
+    showMessage('Working…');
+    work().then(() => {
+      showMessage('');
+      requestRender();
+    }, showError);
+  }
+
   function dispatch(command: Command) {
-    attempt(() => editor.dispatch(command));
-    layerPanel.update();
+    if (attempt(() => editor.dispatch(command))) showMessage('');
   }
 
   const layerPanel = createLayerPanel(
@@ -127,12 +98,48 @@ async function main() {
     (command) => attempt(() => editor.preview(command)),
     () => attempt(() => editor.commitPreview())
   );
+  const textPanel = createTextPanel(editor, layerPanel.activeLayer, attempt);
+
+  function pan(dx: number, dy: number) {
+    autoFit = false;
+    editor.panBy(dx, dy);
+    requestRender();
+  }
+
+  const tools = createTools({
+    editor,
+    canvas,
+    overlay,
+    activeLayer: layerPanel.activeLayer,
+    attempt,
+    run,
+    dispatch,
+    addText: (point) => textPanel.add(point),
+    pan,
+    hint: showMessage
+  });
+
+  const gestures = listenForGestures(canvas, {
+    press: tools.press,
+    drag: tools.drag,
+    release: tools.release,
+    cancel: tools.cancel,
+    pan,
+    zoom(center, factor) {
+      autoFit = false;
+      editor.zoomAt(center.x, center.y, factor);
+      requestRender();
+    }
+  });
 
   function updatePanels() {
-    const { canUndo, canRedo } = editor.state();
+    const { canUndo, canRedo, selection } = editor.state();
     undoButton.disabled = !canUndo;
     redoButton.disabled = !canRedo;
+    for (const button of selectionButtons) button.disabled = !selection;
+    maskSelectButton.disabled = !layerPanel.activeLayer()?.mask;
     layerPanel.update();
+    textPanel.update();
   }
 
   editor.subscribe((event: EditorEvent) => {
@@ -149,93 +156,86 @@ async function main() {
     requestRender();
   });
 
-  function applyBrush() {
-    const channel = (start: number) => parseInt(colorInput.value.slice(start, start + 2), 16) / 255;
-    attempt(() =>
-      editor.setBrush({
-        diameter: sizeInput.valueAsNumber,
-        hardness: hardnessInput.valueAsNumber,
-        flow: flowInput.valueAsNumber,
-        opacity: brushOpacityInput.valueAsNumber,
-        color: [channel(1), channel(3), channel(5)]
-      })
-    );
+  bindOptions(editor, attempt);
+
+  // Selection actions
+  function selectAll() {
+    const { width, height } = editor;
+    dispatch({ type: 'select', shape: { type: 'rectangle', x: 0, y: 0, width, height } });
   }
 
-  for (const input of [sizeInput, hardnessInput, flowInput, brushOpacityInput, colorInput])
-    input.addEventListener('input', applyBrush);
-  applyBrush();
+  function clearSelected() {
+    const layer = layerPanel.activeLayer();
+    if (!layer || !editor.state().selection) return;
+    run(() => editor.fill({ id: layer.id, x: 0, y: 0, color: [0, 0, 0, 0], tolerance: 1 }));
+  }
 
-  let gesture: 'paint' | 'pan' | null = null;
-  let autoFit = true;
+  function maskFromSelection() {
+    const layer = layerPanel.activeLayer();
+    if (layer) dispatch({ type: 'maskFromSelection', id: layer.id });
+  }
 
-  canvas.addEventListener('pointerdown', (event) => {
-    if (gesture || (event.button !== 0 && event.button !== 1)) return;
-    event.preventDefault();
-    if (event.button === 1) {
-      gesture = 'pan';
-    } else {
-      attempt(() => {
-        const { x, y } = canvasPoint(event);
-        editor.beginStroke(x, y, pressure(event));
-        gesture = 'paint';
-      });
-    }
-    if (gesture) canvas.setPointerCapture(event.pointerId);
-  });
+  function selectMask() {
+    const layer = layerPanel.activeLayer();
+    if (layer) run(() => editor.selectMask(layer.id));
+  }
 
-  canvas.addEventListener('pointermove', (event) => {
-    if (!gesture) return;
-    if (gesture === 'pan') {
-      autoFit = false;
-      editor.panBy(event.movementX * devicePixelRatio, event.movementY * devicePixelRatio);
-    } else {
-      const samples = event.getCoalescedEvents?.() ?? [];
-      for (const sample of samples.length ? samples : [event]) {
-        const { x, y } = canvasPoint(sample);
-        editor.extendStroke(x, y, pressure(sample));
-      }
-    }
-    requestRender();
-  });
-
-  canvas.addEventListener('pointercancel', () => {
-    if (gesture === 'paint') attempt(() => editor.cancelStroke());
-    gesture = null;
-  });
-
-  canvas.addEventListener('lostpointercapture', () => {
-    if (gesture === 'paint') attempt(() => editor.endStroke());
-    gesture = null;
-  });
-
-  canvas.addEventListener(
-    'wheel',
-    (event) => {
-      event.preventDefault();
-      const { x, y } = canvasPoint(event);
-      autoFit = false;
-      editor.zoomAt(x, y, Math.exp(-event.deltaY * ZOOM_SPEED));
+  const actions: Record<string, () => void> = {
+    'select-all': selectAll,
+    deselect: () => dispatch({ type: 'deselect' }),
+    invert: () => dispatch({ type: 'invertSelection' }),
+    feather: () => dispatch({ type: 'featherSelection', radius: options.edgeRadius() }),
+    grow: () => dispatch({ type: 'growSelection', radius: options.edgeRadius() }),
+    shrink: () => dispatch({ type: 'shrinkSelection', radius: options.edgeRadius() }),
+    'clear-selected': clearSelected,
+    'mask-from-selection': maskFromSelection,
+    'select-mask': selectMask,
+    undo: () => dispatch({ type: 'undo' }),
+    redo: () => dispatch({ type: 'redo' }),
+    save: () => run(() => saveProject(editor)),
+    export: () => run(() => exportPng(editor)),
+    fit() {
+      autoFit = true;
+      editor.fit();
       requestRender();
-    },
-    { passive: false }
-  );
+    }
+  };
+  for (const [id, action] of Object.entries(actions)) element(id).addEventListener('click', action);
+
+  // Keyboard
+  const commandKeys: Record<string, () => void> = {
+    z: actions.undo,
+    'shift+z': actions.redo,
+    y: actions.redo,
+    a: actions['select-all'],
+    d: actions.deselect,
+    'shift+i': actions.invert
+  };
+  const plainKeys: Record<string, () => void> = {
+    '[': () => options.resizeBrush(-1),
+    ']': () => options.resizeBrush(1),
+    delete: clearSelected,
+    backspace: clearSelected
+  };
 
   addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
-      if (gesture === 'paint') {
-        gesture = null;
-        attempt(() => editor.cancelStroke());
-      }
+      gestures.cancel();
       attempt(() => editor.cancelPreview());
       return;
     }
-    if (!(event.ctrlKey || event.metaKey) || event.target instanceof HTMLInputElement) return;
+    if (isEditingText(event.target)) return;
     const key = event.key.toLowerCase();
-    const redo = key === 'y' || (key === 'z' && event.shiftKey);
-    if (!redo && key !== 'z') return;
-    event.preventDefault();
-    dispatch({ type: redo ? 'redo' : 'undo' });
+    if (event.ctrlKey || event.metaKey) {
+      const action = commandKeys[event.shiftKey ? `shift+${key}` : key];
+      if (!action) return;
+      event.preventDefault();
+      action();
+    } else if (!event.altKey) {
+      const action = plainKeys[key];
+      if (action) action();
+      else tools.chooseByKey(key);
+    }
   });
 
   new ResizeObserver(() => {
@@ -248,8 +248,10 @@ async function main() {
   fileInput.addEventListener('change', async () => {
     const file = fileInput.files?.[0];
     if (!file) return;
+    showMessage(`Opening ${file.name}…`);
     try {
       await openFile(editor, file);
+      showMessage('');
       autoFit = true;
       requestRender();
     } catch (error) {
@@ -258,39 +260,28 @@ async function main() {
     fileInput.value = '';
   });
 
-  undoButton.addEventListener('click', () => dispatch({ type: 'undo' }));
-  redoButton.addEventListener('click', () => dispatch({ type: 'redo' }));
-
-  element('fit').addEventListener('click', () => {
-    autoFit = true;
-    editor.fit();
-    requestRender();
+  panelToggle.addEventListener('click', () => {
+    const isOpen = panelToggle.ariaExpanded !== 'true';
+    panelToggle.ariaExpanded = String(isOpen);
+    document.body.classList.toggle('panel-open', isOpen);
   });
 
-  element('save').addEventListener('click', () => {
-    saveProject(editor).catch(showError);
+  element('benchmark').addEventListener('click', () => {
+    benchmark(editor, canvas).then((result) => {
+      showMessage(
+        [
+          `median ${result.medianFrameMs.toFixed(1)} ms`,
+          `p99 ${result.p99FrameMs.toFixed(1)} ms`,
+          `CPU ${result.cpuMsPerFrame.toFixed(2)} ms`,
+          `uncapped ${result.uncappedMsPerFrame.toFixed(2)} ms`,
+          `readback ${result.readbackMs.toFixed(0)} ms`,
+          `undo ${result.undoMs.toFixed(1)} ms`
+        ].join(', ')
+      );
+    }, showError);
   });
 
-  element('export').addEventListener('click', () => {
-    exportPng(editor).catch(showError);
-  });
-
-  element('benchmark').addEventListener('click', async () => {
-    try {
-      const result = await benchmark(editor, canvas);
-      status.value = [
-        `median ${result.medianFrameMs.toFixed(1)} ms`,
-        `p99 ${result.p99FrameMs.toFixed(1)} ms`,
-        `CPU ${result.cpuMsPerFrame.toFixed(2)} ms`,
-        `uncapped ${result.uncappedMsPerFrame.toFixed(2)} ms`,
-        `readback ${result.readbackMs.toFixed(0)} ms`,
-        `undo ${result.undoMs.toFixed(1)} ms`
-      ].join(', ');
-    } catch (error) {
-      showError(error);
-    }
-  });
-
+  showMessage('');
   updatePanels();
   requestRender();
 }
