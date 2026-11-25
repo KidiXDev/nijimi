@@ -8,7 +8,7 @@ An open-source, GPU-accelerated, headless image editing engine for the web.
 - **Headless:** no toolbar, panels or framework. You give it a canvas and build your own interface on its API.
 - **For the web:** works in any web app or desktop webview that supports WebGPU.
 
-The engine supports layers, groups, masks, color grading, painting, canvas and layer edits, undo and project files. The API may change.
+The engine supports layers, groups, masks, color grading, painting, selections, retouching, text, canvas and layer edits, undo and project files. The API may change.
 
 ## Layout
 
@@ -33,7 +33,7 @@ bun run lint
 bun run typecheck
 ```
 
-In the playground, paint with the left button, pan with the middle button and zoom with the wheel. Escape cancels a stroke. The benchmark replaces the open document.
+In the playground, use the active tool with the left button or one finger. Pan with the middle button and zoom with the wheel, or do both with two fingers. Escape cancels a stroke or drag. Tooltips show the shortcut of each tool. The benchmark replaces the open document.
 
 ## Usage
 
@@ -91,6 +91,41 @@ Vite apps must add `nijimi` to `optimizeDeps.exclude`, otherwise the dev server 
 - `importRgba(width, height, pixels, { x, y, name })` adds an undoable layer at the given document position. Pixels are straight RGBA8, with transparent space where the image does not cover the canvas.
 - `exportRegion(rect)` returns composite RGBA8. `exportLayer(id, rect?)` returns isolated RGBA8 and `exportLayerMask(id, rect?)` returns one alpha byte per pixel. The layer's own visibility and opacity are ignored. A group's descendants keep their appearance. Omitting the region exports the whole canvas.
 
+### Selections
+
+```ts
+editor.dispatch({ type: 'select', shape: { type: 'ellipse', x: 100, y: 100, width: 400, height: 300 } });
+editor.dispatch({ type: 'featherSelection', radius: 12 });
+await editor.selectSimilar({ x: 500, y: 200, tolerance: 0.1, mode: 'add' });
+editor.dispatch({ type: 'maskFromSelection', id: layer });
+editor.dispatch({ type: 'deselect' });
+```
+
+- Strokes, mask strokes, fills, retouching and `transformLayer` change only selected pixels, weighted by how strongly each pixel is selected. `transformLayer` lifts the selected pixels, moves them over the rest and moves the selection with them. Layer masks stay where they are. Adjustment settings, imports and `setMaskAlpha` ignore the selection.
+- `select` takes a rectangle, an ellipse or a lasso. `selectSimilar` is the wand: it compares sRGB bytes of the visible composite, or of one layer when `layer` is given. `mode` is `replace`, `add`, `subtract` or `intersect`, and every mode acts like `replace` while nothing is selected.
+- `growSelection` and `shrinkSelection` move the edge by up to 500 pixels and harden it. `featherSelection` softens within its radius. None of them pulls the selection away from the canvas border.
+- A command that would leave no pixels selected throws and keeps the selection. Use `deselect` to remove it.
+- `maskFromSelection` creates or replaces a layer mask, and `selectMask(id, mode?)` reads one back.
+- Selection changes are undoable and send `selectionChanged`. `state().selection` holds the bounds. `render()` draws the outline, exports leave it out, and project files do not store it.
+
+### Retouching
+
+- `beginRetouchStroke(tool, x, y, pressure)` starts a stroke on the selected layer, continued with `extendStroke` and `endStroke`. The `retouchStroke` command paints a whole stroke. Both use the size, hardness, flow and opacity of the brush.
+- `clone` and `heal` copy from `offsetX, offsetY` pixels away on the same layer, as it was before the stroke. `heal` keeps the copied texture and matches the color around the stroke. It shows a plain copy until the stroke ends.
+- `smudge` drags pixels along the stroke, where flow sets the strength. `blur` blurs with a radius from 1 to 32 pixels.
+
+### Text layers
+
+```ts
+await document.fonts.load('48px Inter');
+const title = editor.addText({ text: 'Hello', x: 100, y: 80, fontFamily: 'Inter, sans-serif', fontSize: 48 });
+editor.setText(title, { ...editor.state().layers.at(-1)!.text!, text: 'Hello again' });
+```
+
+- The browser draws the text with a 2D canvas, so load a web font before using it. `x, y` is the top of the first line, at its left edge, center or right edge depending on `align`. Line breaks come only from the text itself.
+- Settings stay editable through undo, transforms and project files. Transforms and crops update the settings and resample the pixels. Call `setText` with the current settings to draw them sharply again.
+- A text layer rejects strokes, fills and moving selected pixels until `rasterizeText` turns it into a raster layer.
+
 ### Masks and color grading
 
 ```ts
@@ -113,7 +148,7 @@ editor.render();
 
 ### Project files
 
-`saveProject()` captures the document when it is called, so editing can continue while it runs. A `.nijimi` file is a zip with `manifest.json` and one entry per 256×256 tile, as `tiles/<layer id>/<x>_<y>` in little-endian RGBA16F with premultiplied alpha. Version 2 records the adjustment settings in the manifest, mask tiles under `masks/`, and LUT samples under `luts/`. Version 1 projects remain readable. `loadProject()` checks the whole file first and keeps the open document if anything is wrong. If several files are opened at once, the last call wins.
+`saveProject()` captures the document when it is called, so editing can continue while it runs. A `.nijimi` file is a zip with `manifest.json` and one entry per 256×256 tile, as `tiles/<layer id>/<x>_<y>` in little-endian RGBA16F with premultiplied alpha. Version 2 added adjustment settings in the manifest, mask tiles under `masks/`, and LUT samples under `luts/`. Version 3 added text settings. Older projects remain readable. `loadProject()` checks the whole file first and keeps the open document if anything is wrong. If several files are opened at once, the last call wins.
 
 ### GPU device loss
 
@@ -127,6 +162,7 @@ Pixels live on the GPU, so a lost device cannot be restored in place. The engine
 - Each visible blur or sharpen also redraws the tiles next to a change, so painting slows down as they stack up.
 - A project can have at most 1,000 layers, 16 nested groups and 32,768 tiles.
 - Groups cannot pass through to the layers below.
+- Smudge copies the area under the brush once per dab, so very large brushes cost more than painting.
 - WebGPU is required. There is no WebGL fallback.
 
 ## Licence
