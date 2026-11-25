@@ -1843,3 +1843,57 @@ fn blur_and_sharpen_match_reference_values_across_a_tile_border() {
         }
     }
 }
+
+#[test]
+fn painting_under_spatial_adjustments_matches_a_reopened_document() {
+    let mut editor = Editor::new((1600, 1400));
+    editor
+        .engine
+        .load_rgba(1600, 1400, &test_image((1600, 1400)))
+        .unwrap();
+    add_adjustment(&mut editor, Adjustment::Sharpen { amount: 1.0 });
+    let group = editor
+        .dispatch(Command::AddGroup {
+            name: None,
+            parent: None,
+            index: None,
+        })
+        .unwrap();
+    let inside = Some(Some(group));
+    let layer = editor
+        .dispatch(Command::AddLayer {
+            name: None,
+            parent: inside,
+            index: None,
+        })
+        .unwrap();
+    let wide = Brush {
+        diameter: 2400.0,
+        color: [0.2, 0.5, 0.9],
+        ..hard_brush()
+    };
+    editor.paint(layer, wide, &[(800.0, 700.0)]);
+    for radius in [32, 20] {
+        editor.dispatch(Command::AddAdjustment {
+            name: None,
+            parent: inside,
+            index: None,
+            adjustment: Adjustment::Blur { radius },
+        });
+    }
+    editor.dispatch(Command::SetLayerOpacity {
+        id: group,
+        opacity: 0.8,
+    });
+    editor.pixels();
+    for (target, point) in [
+        (layer, (740.0, 740.0)),
+        (layer, (1060.0, 1300.0)),
+        (FIRST_LAYER, (1013.5, 100.0)),
+    ] {
+        editor.paint(target, hard_brush(), &[point]);
+        let mut reopened = Editor::new((10, 10));
+        reopened.load(editor.save()).unwrap();
+        assert_same(&editor.pixels(), &reopened.pixels());
+    }
+}

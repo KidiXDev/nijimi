@@ -124,7 +124,7 @@ Pixels live on the GPU, so a lost device cannot be restored in place. The engine
 - The composited image is one RGBA16F texture with mipmaps (about 88 MB at 4K), in addition to the layer tiles. The largest side is the GPU texture limit.
 - Synchronous GPU edits can emit `gpuError` after a change if the GPU runs out of memory. `loadProject` and `fill` reject on GPU allocation errors before committing.
 - Saves read tiles in batches and compress them on the main thread.
-- Active blur and sharpen rebuild the canvas on dirty frames so their neighborhoods stay current across tile boundaries.
+- Each visible blur or sharpen also redraws the tiles next to a change, so painting slows down as they stack up.
 - A project can have at most 1,000 layers, 16 nested groups and 32,768 tiles.
 - Groups cannot pass through to the layers below.
 - WebGPU is required. There is no WebGL fallback.

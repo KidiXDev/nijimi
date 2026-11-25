@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    collections::BTreeSet,
     sync::{Arc, Weak},
 };
 
@@ -194,6 +195,23 @@ impl Grade {
         ]);
         gpu.bind(&gpu.layouts.grade, &resources)
     }
+}
+
+pub(crate) fn grown(
+    coords: &BTreeSet<TileCoord>,
+    size: (u32, u32),
+    (columns, rows): (u32, u32),
+) -> BTreeSet<TileCoord> {
+    coords
+        .iter()
+        .flat_map(|coord| {
+            (coord.y.saturating_sub(rows)..=coord.y + rows).flat_map(move |y| {
+                (coord.x.saturating_sub(columns)..=coord.x + columns)
+                    .map(move |x| TileCoord::new(x, y))
+            })
+        })
+        .filter(|coord| coord.is_inside(size))
+        .collect()
 }
 
 pub(crate) fn neighbors<'a>(
