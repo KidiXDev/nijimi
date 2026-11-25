@@ -1674,3 +1674,29 @@ fn blur_crosses_both_tile_axes_inside_an_isolated_group() {
     editor.dispatch(Command::Undo);
     assert_eq!(editor.pixels(), graded);
 }
+
+#[test]
+fn cropped_pixels_stay_gone_when_the_canvas_grows_again() {
+    let mut editor = Editor::new((512, 512));
+    editor
+        .engine
+        .load_rgba(512, 512, &[255, 0, 0, 255].repeat(512 * 512))
+        .unwrap();
+    assert_eq!(editor.pixel(400, 400), [255, 0, 0, 255]);
+    editor.dispatch(Command::Crop {
+        rect: PixelRect {
+            x: 0,
+            y: 0,
+            width: 256,
+            height: 256,
+        },
+    });
+    editor.dispatch(Command::ExtendCanvas {
+        left: 0,
+        top: 0,
+        right: 256,
+        bottom: 256,
+    });
+    assert_eq!(editor.pixel(255, 255), [255, 0, 0, 255]);
+    assert_eq!(editor.pixel(400, 400), [0; 4]);
+}

@@ -651,8 +651,7 @@ impl<T: Clone> Document<T> {
                 let rasters = self.swap_plane(rasters, false);
                 let masks = self.swap_plane(masks, true);
                 if old_size != size {
-                    self.dirty.retain(|coord| coord.is_inside(size));
-                    self.mark_all_dirty();
+                    self.dirty = TileCoord::all(size).collect();
                     self.events.push(Event::CanvasResized {
                         width: size.0,
                         height: size.1,

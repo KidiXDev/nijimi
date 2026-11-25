@@ -357,3 +357,15 @@ fn the_latest_change_stays_undoable_when_it_exceeds_the_limit() {
     document.rename_layer(GROUP, "Renamed".into()).unwrap();
     assert!(document.history_bytes() <= TILE);
 }
+
+#[test]
+fn resizing_the_canvas_redraws_every_tile() {
+    let mut document = sample();
+    document.replace_rasters((256, 256), Vec::new()).unwrap();
+    document.replace_rasters(SIZE, Vec::new()).unwrap();
+    assert!(document.take_dirty().into_iter().eq({
+        let mut all: Vec<_> = TileCoord::all(SIZE).collect();
+        all.sort();
+        all
+    }));
+}
