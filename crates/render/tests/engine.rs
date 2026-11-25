@@ -1,7 +1,7 @@
 use futures_channel::mpsc::UnboundedReceiver;
 use nijimi_core::{
-    BlendMode, Brush, Command, DocumentError, Event, LayerId, Point, ProjectError, StrokePoint,
-    TileCoord, Viewport,
+    BlendMode, Brush, BrushDynamics, Command, DocumentError, Event, LayerId, PixelRect, Point,
+    ProjectError, StrokePoint, TileCoord, Transform, Viewport,
 };
 use nijimi_render::{Engine, EngineError, wgpu};
 use pollster::block_on;
@@ -612,6 +612,17 @@ fn every_command_round_trips_through_undo_and_redo() {
     assert_pixels_undoable("paint stroke", |editor, _, child| {
         editor.paint(child, hard_brush(), &[(20.0, 20.0), (580.0, 290.0)]);
     });
+    assert_pixels_undoable("paint with dynamics", |editor, _, child| {
+        editor.dispatch(Command::PaintWithDynamics {
+            layer: child,
+            brush: hard_brush(),
+            dynamics: BrushDynamics {
+                stabilizer: 0.5,
+                ..BrushDynamics::default()
+            },
+            points: vec![at(20.0, 20.0), at(580.0, 290.0)],
+        });
+    });
     assert_pixels_undoable("select layer and paint", |editor, _, child| {
         editor.paint(child, hard_brush(), &[(20.0, 20.0)]);
         editor.dispatch(Command::SelectLayer { id: child });
@@ -984,4 +995,271 @@ fn incremental_compositing_matches_a_reopened_document() {
     let mut reopened = Editor::new((10, 10));
     reopened.load(editor.save()).expect("load");
     assert_same(&editor.pixels(), &reopened.pixels());
+}
+
+#[test]
+fn positioned_import_region_and_layer_export_round_trip() {
+    let mut editor = Editor::new((280, 4));
+    let layer = editor
+        .engine
+        .import_rgba(
+            (4, 1),
+            &[
+                255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 255, 255, 255, 255, 0,
+            ],
+            (254, 2),
+            Some("Strip".into()),
+            None,
+        )
+        .unwrap();
+    let rect = PixelRect {
+        x: 254,
+        y: 2,
+        width: 4,
+        height: 1,
+    };
+    let read = |readback: nijimi_render::Readback| block_on(readback.pixels()).unwrap();
+    let expected = [255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 255, 0, 0, 0, 0];
+    assert_eq!(
+        read(editor.engine.read_region(Some(rect)).unwrap()),
+        expected
+    );
+    let before = editor.pixels();
+    editor.dispatch(Command::Undo);
+    assert!(editor.engine.document().layer(layer).is_err());
+    assert_eq!(editor.pixel(254, 2), [0; 4]);
+    editor.dispatch(Command::Redo);
+    assert_eq!(editor.pixels(), before);
+
+    editor.dispatch(Command::SetLayerVisible {
+        id: layer,
+        visible: false,
+    });
+    editor.dispatch(Command::SetLayerOpacity {
+        id: layer,
+        opacity: 0.0,
+    });
+    assert_eq!(
+        read(editor.engine.read_region(Some(rect)).unwrap()),
+        [0; 16]
+    );
+    assert_eq!(
+        read(editor.engine.read_layer(layer, Some(rect)).unwrap()),
+        expected
+    );
+    assert!(
+        editor
+            .engine
+            .read_region(Some(PixelRect { x: 279, ..rect }))
+            .is_err()
+    );
+
+    editor
+        .engine
+        .import_rgba((3, 1), &expected[..12], (-1, 0), None, None)
+        .unwrap();
+    assert_eq!(editor.pixel(0, 0), [0, 255, 0, 128]);
+    assert_eq!(editor.pixel(1, 0), [0, 0, 255, 255]);
+}
+
+#[test]
+fn canvas_edits_clip_edge_tiles_and_round_trip() {
+    let mut editor = Editor::new((270, 4));
+    let id = editor
+        .engine
+        .import_rgba(
+            (3, 1),
+            &[255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255],
+            (254, 2),
+            None,
+            None,
+        )
+        .unwrap();
+    let before = editor.pixels();
+    editor.dispatch(Command::Crop {
+        rect: PixelRect {
+            x: 1,
+            y: 1,
+            width: 255,
+            height: 3,
+        },
+    });
+    assert_eq!(editor.engine.document().size(), (255, 3));
+    assert_eq!(editor.pixel(253, 1), [255, 0, 0, 255]);
+    assert_eq!(editor.pixel(254, 1), [0, 255, 0, 255]);
+    let cropped = editor.pixels();
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.engine.document().size(), (270, 4));
+    assert_eq!(editor.pixels(), before);
+    editor.dispatch(Command::Redo);
+    assert_eq!(editor.pixels(), cropped);
+
+    editor.dispatch(Command::ExtendCanvas {
+        left: 1,
+        top: 1,
+        right: 3,
+        bottom: 0,
+    });
+    assert_eq!(editor.engine.document().size(), (259, 4));
+    assert_eq!(editor.pixel(255, 2), [0, 255, 0, 255]);
+    assert_eq!(editor.pixel(256, 2), [0; 4]);
+    let extended = editor.pixels();
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.pixels(), cropped);
+    editor.dispatch(Command::Redo);
+    assert_eq!(editor.pixels(), extended);
+
+    editor.dispatch(Command::ResizeCanvas {
+        width: 300,
+        height: 8,
+        x: -2,
+        y: 1,
+    });
+    assert_eq!(editor.pixel(253, 3), [0, 255, 0, 255]);
+    assert_eq!(editor.engine.document().active(), Some(id));
+    let resized = editor.pixels();
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.pixels(), extended);
+    editor.dispatch(Command::Redo);
+    assert_eq!(editor.pixels(), resized);
+
+    let file = editor.save();
+    editor.load(file).unwrap();
+    assert_eq!(editor.engine.document().size(), (300, 8));
+    assert_eq!(editor.pixels(), resized);
+}
+
+#[test]
+fn transform_uses_one_preview_undo_step_and_preserves_project_snapshots() {
+    let mut editor = Editor::new((300, 6));
+    let id = editor
+        .engine
+        .import_rgba((1, 1), &[255, 0, 0, 255], (253, 2), None, None)
+        .unwrap();
+    let before = editor.pixels();
+    let history = editor.engine.document().history_bytes();
+    let translate = |x| Command::TransformLayer {
+        id,
+        transform: Transform {
+            x,
+            ..Transform::default()
+        },
+    };
+    editor.engine.preview(translate(2.0)).unwrap();
+    assert_eq!(editor.pixel(255, 2), [255, 0, 0, 255]);
+    editor.engine.preview(translate(4.0)).unwrap();
+    assert_eq!(editor.pixel(257, 2), [255, 0, 0, 255]);
+    assert_eq!(editor.pixel(255, 2), [0; 4]);
+    assert_eq!(editor.engine.committed_document().history_bytes(), history);
+    let saved = editor.save();
+    let mut reopened = Editor::new((1, 1));
+    reopened.load(saved).unwrap();
+    assert_eq!(reopened.pixels(), before);
+
+    editor.engine.cancel_preview();
+    assert_eq!(editor.pixels(), before);
+    editor.engine.preview(translate(4.0)).unwrap();
+    editor.engine.commit_preview().unwrap();
+    assert_eq!(editor.pixel(257, 2), [255, 0, 0, 255]);
+    let committed = editor.pixels();
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.pixels(), before);
+    editor.dispatch(Command::Redo);
+    assert_eq!(editor.pixels(), committed);
+}
+
+#[test]
+fn group_transform_combines_scale_flip_translation_and_rotation() {
+    let mut editor = Editor::new((12, 12));
+    let group = editor
+        .dispatch(Command::AddGroup {
+            name: None,
+            parent: None,
+            index: None,
+        })
+        .unwrap();
+    editor
+        .engine
+        .import_rgba(
+            (2, 1),
+            &[255, 0, 0, 255, 0, 255, 0, 255],
+            (1, 1),
+            None,
+            Some(nijimi_core::LayerPlace {
+                parent: Some(group),
+                index: 0,
+            }),
+        )
+        .unwrap();
+    let before = editor.pixels();
+    editor.dispatch(Command::TransformLayer {
+        id: group,
+        transform: Transform {
+            pivot: Some(Point::new(0.0, 0.0)),
+            x: 5.0,
+            y: 7.0,
+            scale_x: -2.0,
+            scale_y: 1.0,
+            rotation: 90.0,
+        },
+    });
+    assert_eq!(editor.pixel(3, 3), [255, 0, 0, 255]);
+    assert_eq!(editor.pixel(3, 4), [255, 0, 0, 255]);
+    assert_eq!(editor.pixel(3, 1), [0, 255, 0, 255]);
+    assert_eq!(editor.pixel(3, 2), [0, 255, 0, 255]);
+    assert_eq!(editor.pixel(1, 1), [0; 4]);
+    let after = editor.pixels();
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.pixels(), before);
+    editor.dispatch(Command::Redo);
+    assert_eq!(editor.pixels(), after);
+}
+
+#[test]
+fn fill_and_erase_are_undoable_and_stale_fills_fail() {
+    let mut editor = Editor::new((260, 2));
+    let id = editor
+        .engine
+        .import_rgba((1, 2), &[0, 0, 0, 255, 0, 0, 0, 255], (258, 0), None, None)
+        .unwrap();
+    let before = editor.pixels();
+    let red = [1.0, 0.0, 0.0, 1.0];
+    let job = editor.engine.fill(id, (0, 0), red, 0.0).unwrap();
+    editor.dispatch(Command::SetLayerOpacity { id, opacity: 0.5 });
+    let stale = block_on(job.prepare()).unwrap();
+    assert!(matches!(
+        editor.engine.commit_fill(stale),
+        Err(EngineError::StaleFill)
+    ));
+    editor.dispatch(Command::Undo);
+
+    let job = editor.engine.fill(id, (0, 0), red, 0.0).unwrap();
+    editor
+        .engine
+        .commit_fill(block_on(job.prepare()).unwrap())
+        .unwrap();
+    assert_eq!(editor.pixel(257, 0), [255, 0, 0, 255]);
+    assert_eq!(editor.pixel(258, 0), [0, 0, 0, 255]);
+    assert_eq!(editor.pixel(259, 0), [0; 4]);
+    let filled = editor.pixels();
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.pixels(), before);
+    editor.dispatch(Command::Redo);
+    assert_eq!(editor.pixels(), filled);
+
+    editor.dispatch(Command::EraseStroke {
+        layer: id,
+        brush: Brush {
+            opacity: 0.5,
+            ..hard_brush()
+        },
+        points: vec![at(256.5, 0.5)],
+        dynamics: BrushDynamics::default(),
+    });
+    let erased = editor.pixels();
+    assert_near(&editor.pixel(256, 0), &[255, 0, 0, 128], 1);
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.pixels(), filled);
+    editor.dispatch(Command::Redo);
+    assert_eq!(editor.pixels(), erased);
 }

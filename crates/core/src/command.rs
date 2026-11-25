@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer};
 
-use crate::{BlendMode, Brush, LayerId, StrokePoint};
+use crate::{BlendMode, Brush, BrushDynamics, LayerId, PixelRect, StrokePoint, Transform};
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(
@@ -52,6 +52,40 @@ pub enum Command {
         layer: LayerId,
         brush: Brush,
         points: Vec<StrokePoint>,
+    },
+    EraseStroke {
+        layer: LayerId,
+        brush: Brush,
+        points: Vec<StrokePoint>,
+        #[serde(default)]
+        dynamics: BrushDynamics,
+    },
+    PaintWithDynamics {
+        layer: LayerId,
+        brush: Brush,
+        points: Vec<StrokePoint>,
+        dynamics: BrushDynamics,
+    },
+    Crop {
+        rect: PixelRect,
+    },
+    ResizeCanvas {
+        width: u32,
+        height: u32,
+        #[serde(default)]
+        x: i32,
+        #[serde(default)]
+        y: i32,
+    },
+    ExtendCanvas {
+        left: u32,
+        top: u32,
+        right: u32,
+        bottom: u32,
+    },
+    TransformLayer {
+        id: LayerId,
+        transform: Transform,
     },
     Undo,
     Redo,

@@ -10,6 +10,8 @@ use crate::LayerId;
 )]
 pub enum Event {
     DocumentReplaced,
+    CanvasResized { width: u32, height: u32 },
+    PreviewChanged,
     LayerAdded { id: LayerId },
     LayerRemoved { id: LayerId },
     LayerMoved { id: LayerId },

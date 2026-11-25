@@ -1,6 +1,9 @@
 use std::{collections::BTreeMap, rc::Rc};
 
-use nijimi_core::{Document, Layer, LayerId, ProjectReader, ProjectWriter, TileCoord, Tiles};
+use nijimi_core::{
+    Document, Layer, LayerId, MAX_PROJECT_TILES, ProjectReader, ProjectWriter, TILE_BYTES,
+    TileCoord, Tiles,
+};
 
 use crate::{
     EngineError,
@@ -11,6 +14,7 @@ use crate::{
 };
 
 const TILES_PER_LOAD_BATCH: usize = 8;
+pub(crate) const TILES_PER_READBACK: usize = 32;
 
 pub struct ProjectSnapshot {
     pub(crate) gpu: Rc<Gpu>,
@@ -21,13 +25,24 @@ pub struct ProjectSnapshot {
 
 impl ProjectSnapshot {
     pub async fn encode(self) -> Result<Vec<u8>, EngineError> {
+        let tiles = tile_list(&self.layers);
+        if tiles.len() > MAX_PROJECT_TILES {
+            return Err(nijimi_core::ProjectError::TooManyTiles.into());
+        }
         let mut writer = ProjectWriter::default();
-        for (layer, coord, tile) in tile_list(&self.layers) {
+        for batch in tiles.chunks(TILES_PER_READBACK) {
             self.gpu.check_device()?;
-            let readback = self
-                .gpu
-                .submit(|encoder| Readback::record_tile(&self.gpu.device, encoder, &tile));
-            writer.add_tile(layer, coord, &readback.pixels().await?)?;
+            let readback = self.gpu.submit(|encoder| {
+                Readback::record_tiles(
+                    &self.gpu.device,
+                    encoder,
+                    batch.iter().map(|(_, _, tile)| tile.as_ref()),
+                )
+            });
+            let pixels = readback.pixels().await?;
+            for ((layer, coord, _), pixels) in batch.iter().zip(pixels.chunks_exact(TILE_BYTES)) {
+                writer.add_tile(*layer, *coord, pixels)?;
+            }
         }
         Ok(writer.finish(self.size, &self.layers, self.active)?)
     }

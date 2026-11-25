@@ -4,6 +4,8 @@ use crate::{Layer, LayerId, LayerProperties, TILE_BYTES, TileCoord};
 
 pub const DEFAULT_HISTORY_LIMIT: u64 = 256 * 1024 * 1024;
 
+pub type RasterEdit<T> = (LayerId, Vec<(TileCoord, Option<T>)>);
+
 const ENTRY_BYTES: u64 = 512;
 
 #[derive(Debug)]
@@ -25,9 +27,9 @@ pub(crate) enum Edit<T> {
         id: LayerId,
         properties: LayerProperties,
     },
-    Tiles {
-        id: LayerId,
-        tiles: Vec<(TileCoord, Option<T>)>,
+    Rasters {
+        size: (u32, u32),
+        layers: Vec<RasterEdit<T>>,
     },
 }
 
@@ -41,10 +43,13 @@ impl<T> Edit<T> {
                 });
                 bytes
             }
-            Self::Tiles { tiles, .. } => {
-                let kept = tiles.iter().filter(|(_, tile)| tile.is_some()).count();
-                tile_bytes(kept) + size_of_val(tiles.as_slice()) as u64
-            }
+            Self::Rasters { layers, .. } => layers
+                .iter()
+                .map(|(_, tiles)| {
+                    let kept = tiles.iter().filter(|(_, tile)| tile.is_some()).count();
+                    tile_bytes(kept) + size_of_val(tiles.as_slice()) as u64
+                })
+                .sum(),
             Self::Remove { .. } | Self::Move { .. } | Self::Properties { .. } => 0,
         };
         ENTRY_BYTES + payload

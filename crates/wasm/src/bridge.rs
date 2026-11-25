@@ -1,6 +1,6 @@
 use js_sys::JSON;
-use nijimi_core::{Document, Layer, LayerContent, LayerId, LayerProperties};
-use serde::{Serialize, de::DeserializeOwned};
+use nijimi_core::{Document, Layer, LayerContent, LayerId, LayerPlace, LayerProperties};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(typescript_custom_section)]
@@ -24,6 +24,60 @@ export interface Brush {
   color: [red: number, green: number, blue: number];
 }
 
+export type BrushPreset = 'pencil' | 'round' | 'airbrush';
+
+export interface BrushDynamics {
+  pressureCurve?: 'linear' | 'soft' | 'firm' | 'fixed';
+  /** Fraction of the previous sample retained each step, from 0 to 0.95. */
+  stabilizer?: number;
+}
+
+export interface Point {
+  x: number;
+  y: number;
+}
+
+export interface PixelRect extends Point {
+  width: number;
+  height: number;
+}
+
+export type CropRatio = 'square' | 'classic' | 'photo' | 'wide' | 'portrait';
+
+/** Scale, then rotate clockwise in degrees, then translate in document pixels. */
+export interface LayerTransform {
+  x?: number;
+  y?: number;
+  /** Use a negative scale to flip an axis. */
+  scaleX?: number;
+  scaleY?: number;
+  /** Defaults to the center of the document. */
+  pivot?: Point;
+  rotation?: number;
+}
+
+export interface ImportOptions {
+  x?: number;
+  y?: number;
+  name?: string;
+  parent?: number | null;
+  index?: number;
+}
+
+export interface FillOptions extends Point {
+  id: number;
+  /** Straight sRGB and alpha, each in the range [0, 1]. */
+  color: [number, number, number, number];
+  tolerance?: number;
+}
+
+export type PreviewCommand =
+  | { type: 'setLayerOpacity'; id: number; opacity: number }
+  | { type: 'crop'; rect: PixelRect }
+  | { type: 'resizeCanvas'; width: number; height: number; x?: number; y?: number }
+  | { type: 'extendCanvas'; left: number; top: number; right: number; bottom: number }
+  | { type: 'transformLayer'; id: number; transform: LayerTransform };
+
 export interface StrokePoint {
   x: number;
   y: number;
@@ -42,15 +96,19 @@ export type Command =
   | { type: 'moveLayer'; id: number; parent: number | null; index: number }
   | { type: 'renameLayer'; id: number; name: string }
   | { type: 'setLayerVisible'; id: number; visible: boolean }
-  | { type: 'setLayerOpacity'; id: number; opacity: number }
+  | PreviewCommand
   | { type: 'setLayerBlendMode'; id: number; blendMode: BlendMode }
   | { type: 'selectLayer'; id: number }
   | { type: 'paintStroke'; layer: number; brush: Brush; points: StrokePoint[] }
+  | { type: 'paintWithDynamics'; layer: number; brush: Brush; dynamics: BrushDynamics; points: StrokePoint[] }
+  | { type: 'eraseStroke'; layer: number; brush: Brush; dynamics?: BrushDynamics; points: StrokePoint[] }
   | { type: 'undo' }
   | { type: 'redo' };
 
 export type EditorEvent =
   | { type: 'documentReplaced' }
+  | { type: 'canvasResized'; width: number; height: number }
+  | { type: 'previewChanged' }
   | { type: 'layerAdded'; id: number }
   | { type: 'layerRemoved'; id: number }
   | { type: 'layerMoved'; id: number }
@@ -81,6 +139,42 @@ export interface EditorState {
 }
 "#;
 
+#[derive(Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct ImportOptions {
+    pub x: i32,
+    pub y: i32,
+    pub name: Option<String>,
+    #[serde(deserialize_with = "present_parent")]
+    pub parent: Option<Option<LayerId>>,
+    pub index: Option<usize>,
+}
+
+impl ImportOptions {
+    pub fn place(&self) -> Option<LayerPlace> {
+        (self.parent.is_some() || self.index.is_some()).then(|| LayerPlace {
+            parent: self.parent.flatten(),
+            index: self.index.unwrap_or(usize::MAX),
+        })
+    }
+}
+
+fn present_parent<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<LayerId>>, D::Error> {
+    Option::<LayerId>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct FillOptions {
+    pub id: LayerId,
+    pub x: u32,
+    pub y: u32,
+    pub color: [f32; 4],
+    #[serde(default)]
+    pub tolerance: f32,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EditorState<'a> {
@@ -102,14 +196,14 @@ struct LayerState<'a> {
 }
 
 impl<'a> EditorState<'a> {
-    pub fn new<T: Clone>(document: &'a Document<T>) -> Self {
+    pub fn new<T: Clone>(document: &'a Document<T>, committed: &Document<T>) -> Self {
         let (width, height) = document.size();
         Self {
             width,
             height,
             active_layer: document.active(),
-            can_undo: document.can_undo(),
-            can_redo: document.can_redo(),
+            can_undo: committed.can_undo(),
+            can_redo: committed.can_redo(),
             layers: layer_states(document.layers()),
         }
     }

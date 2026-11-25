@@ -1,4 +1,5 @@
 use futures_channel::oneshot;
+use nijimi_core::{TILE_BYTES, TILE_SIZE};
 
 use crate::{EngineError, tile::Tile};
 
@@ -21,12 +22,38 @@ impl Readback {
         Self::record(device, encoder, image, RGBA8_BYTES)
     }
 
-    pub(crate) fn record_tile(
+    pub(crate) fn record_tiles<'a>(
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        tile: &Tile,
+        tiles: impl ExactSizeIterator<Item = &'a Tile>,
     ) -> Self {
-        Self::record(device, encoder, tile.texture(), RGBA16F_BYTES)
+        let row = TILE_SIZE * RGBA16F_BYTES;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tile readback"),
+            size: (tiles.len() * TILE_BYTES) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        for (index, tile) in tiles.enumerate() {
+            encoder.copy_texture_to_buffer(
+                tile.texture().as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: (index * TILE_BYTES) as u64,
+                        bytes_per_row: Some(row),
+                        rows_per_image: None,
+                    },
+                },
+                tile.texture().size(),
+            );
+        }
+        Self {
+            device: device.clone(),
+            buffer,
+            row: row as usize,
+            padded_row: row as usize,
+        }
     }
 
     fn record(
@@ -76,11 +103,14 @@ impl Readback {
         receiver.await.map_err(gpu_error)?.map_err(gpu_error)?;
 
         let mapped = self.buffer.get_mapped_range(..).map_err(gpu_error)?;
-        Ok(mapped
-            .chunks_exact(self.padded_row)
-            .flat_map(|padded| &padded[..self.row])
-            .copied()
-            .collect())
+        if self.row == self.padded_row {
+            return Ok(mapped.to_vec());
+        }
+        let mut pixels = Vec::with_capacity(mapped.len() / self.padded_row * self.row);
+        for row in mapped.chunks_exact(self.padded_row) {
+            pixels.extend_from_slice(&row[..self.row]);
+        }
+        Ok(pixels)
     }
 }
 

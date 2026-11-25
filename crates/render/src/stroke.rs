@@ -5,7 +5,7 @@ use std::{
 };
 
 use bytemuck::{Pod, Zeroable};
-use nijimi_core::{Brush, Dab, LayerId, Stroke, StrokePoint, TileCoord, Tiles};
+use nijimi_core::{Brush, BrushDynamics, Dab, LayerId, Stroke, StrokePoint, TileCoord, Tiles};
 use wgpu::{BindingResource::TextureView, util::DeviceExt};
 
 use crate::{
@@ -57,12 +57,20 @@ pub(crate) struct ActiveStroke {
     stroke: Stroke,
     pending: Vec<Dab>,
     paint: wgpu::Buffer,
+    erase: bool,
     tiles: BTreeMap<TileCoord, StrokeTile>,
 }
 
 impl ActiveStroke {
-    pub fn begin(gpu: &Gpu, layer: LayerId, brush: Brush, start: StrokePoint) -> Self {
-        let (stroke, dab) = Stroke::begin(brush, start);
+    pub fn begin(
+        gpu: &Gpu,
+        layer: LayerId,
+        brush: Brush,
+        dynamics: BrushDynamics,
+        erase: bool,
+        start: StrokePoint,
+    ) -> Self {
+        let (stroke, dab) = Stroke::with_dynamics(brush, dynamics, start);
         let paint = gpu
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -78,12 +86,17 @@ impl ActiveStroke {
             stroke,
             pending: vec![dab],
             paint,
+            erase,
             tiles: BTreeMap::new(),
         }
     }
 
     pub fn extend(&mut self, point: StrokePoint) {
         self.stroke.extend(point, &mut self.pending);
+    }
+
+    pub fn complete(&mut self) {
+        self.stroke.complete(&mut self.pending);
     }
 
     pub fn layer(&self) -> LayerId {
@@ -122,6 +135,9 @@ impl ActiveStroke {
         let mut dabs_by_tile: BTreeMap<TileCoord, Vec<DabInstance>> = BTreeMap::new();
         for dab in mem::take(&mut self.pending) {
             for coord in dab.tiles(document_size) {
+                if self.erase && !before.contains_key(&coord) {
+                    continue;
+                }
                 let instance = DabInstance::new(&dab, coord);
                 dabs_by_tile.entry(coord).or_default().push(instance);
             }
@@ -160,7 +176,11 @@ impl ActiveStroke {
             draw_fullscreen(
                 encoder,
                 tile.result.view(),
-                &gpu.pipelines.stroke,
+                if self.erase {
+                    &gpu.pipelines.erase
+                } else {
+                    &gpu.pipelines.stroke
+                },
                 &tile.bindings,
             );
             first = last;

@@ -5,14 +5,17 @@ use std::{
 
 use futures_channel::mpsc::UnboundedReceiver;
 use js_sys::{Function, Promise, Uint8Array};
-use nijimi_core::{Brush, Event, LayerId, Point, StrokePoint, Viewport};
-use nijimi_render::Engine;
+use nijimi_core::{
+    Brush, BrushDynamics, BrushPreset, CropRatio, Event, LayerId, PixelRect, Point, StrokePoint,
+    Viewport,
+};
+use nijimi_render::{Engine, EngineError, Readback};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{future_to_promise, spawn_local};
 use web_sys::{HtmlCanvasElement, console};
 use wgpu::CurrentSurfaceTexture;
 
-use crate::bridge::{EditorState, from_js, to_js};
+use crate::bridge::{EditorState, FillOptions, ImportOptions, from_js, to_js};
 
 type Listeners = Rc<RefCell<Vec<(u32, Function)>>>;
 
@@ -28,6 +31,8 @@ struct Session {
     engine: Engine,
     viewport: Viewport,
     brush: Brush,
+    dynamics: BrushDynamics,
+    erase: bool,
 }
 
 #[wasm_bindgen]
@@ -81,6 +86,8 @@ impl Editor {
             engine,
             viewport: Viewport::default(),
             brush: Brush::default(),
+            dynamics: BrushDynamics::default(),
+            erase: false,
         };
         session.fit();
         let listeners = Listeners::default();
@@ -115,7 +122,11 @@ impl Editor {
 
     #[wasm_bindgen(unchecked_return_type = "EditorState")]
     pub fn state(&self) -> Result<JsValue, JsValue> {
-        to_js(&EditorState::new(self.session.borrow().engine.document()))
+        let session = self.session.borrow();
+        to_js(&EditorState::new(
+            session.engine.document(),
+            session.engine.committed_document(),
+        ))
     }
 
     pub fn subscribe(
@@ -141,6 +152,72 @@ impl Editor {
         let command = from_js(&command)?;
         let mut session = self.session.borrow_mut();
         Ok(session.engine.dispatch(command).map_err(JsError::from)?)
+    }
+
+    pub fn preview(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "PreviewCommand")] command: JsValue,
+    ) -> Result<(), JsValue> {
+        self.session
+            .borrow_mut()
+            .engine
+            .preview(from_js(&command)?)
+            .map_err(|error| JsError::from(error).into())
+    }
+
+    #[wasm_bindgen(js_name = commitPreview)]
+    pub fn commit_preview(&mut self) -> Result<(), JsError> {
+        Ok(self.session.borrow_mut().engine.commit_preview()?)
+    }
+
+    #[wasm_bindgen(js_name = cancelPreview)]
+    pub fn cancel_preview(&mut self) {
+        self.session.borrow_mut().engine.cancel_preview();
+    }
+
+    #[wasm_bindgen(js_name = cropRect, unchecked_return_type = "PixelRect")]
+    pub fn crop_rect(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "CropRatio")] preset: JsValue,
+        #[wasm_bindgen(unchecked_optional_param_type = "PixelRect")] bounds: Option<JsValue>,
+    ) -> Result<JsValue, JsValue> {
+        let size = self.session.borrow().engine.committed_document().size();
+        let bounds = optional_rect(bounds)?.unwrap_or_else(|| PixelRect::full(size));
+        let preset: CropRatio = from_js(&preset)?;
+        if !bounds.is_inside(size) {
+            return Err(JsError::from(EngineError::InvalidRegion).into());
+        }
+        let rect = bounds
+            .with_ratio(preset)
+            .ok_or_else(|| JsError::new("The crop ratio cannot fit inside these bounds."))?;
+        to_js(&rect)
+    }
+
+    #[wasm_bindgen(js_name = importRgba)]
+    pub fn import_rgba(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        #[wasm_bindgen(unchecked_optional_param_type = "ImportOptions")] options: Option<JsValue>,
+    ) -> Result<LayerId, JsValue> {
+        let options: ImportOptions = options
+            .as_ref()
+            .map(from_js)
+            .transpose()?
+            .unwrap_or_default();
+        let place = options.place();
+        let mut session = self.session.borrow_mut();
+        Ok(session
+            .engine
+            .import_rgba(
+                (width, height),
+                rgba,
+                (options.x, options.y),
+                options.name,
+                place,
+            )
+            .map_err(JsError::from)?)
     }
 
     #[wasm_bindgen(js_name = setHistoryLimit)]
@@ -191,12 +268,102 @@ impl Editor {
 
     #[wasm_bindgen(js_name = exportRgba, unchecked_return_type = "Promise<Uint8Array>")]
     pub fn export_rgba(&mut self) -> Promise {
-        let readback = self.session.borrow_mut().engine.read_rgba();
+        export_pixels(self.session.borrow_mut().engine.read_rgba(), false)
+    }
+
+    #[wasm_bindgen(js_name = exportRegion, unchecked_return_type = "Promise<Uint8Array>")]
+    pub fn export_region(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "PixelRect")] rect: JsValue,
+    ) -> Promise {
+        let readback = from_js(&rect).and_then(|rect| {
+            self.session
+                .borrow_mut()
+                .engine
+                .read_region(Some(rect))
+                .map_err(|error| JsError::from(error).into())
+        });
+        export_pixels_js(readback, false)
+    }
+
+    #[wasm_bindgen(js_name = exportLayer, unchecked_return_type = "Promise<Uint8Array>")]
+    pub fn export_layer(
+        &mut self,
+        id: LayerId,
+        #[wasm_bindgen(unchecked_optional_param_type = "PixelRect")] rect: Option<JsValue>,
+    ) -> Promise {
+        self.export_layer_pixels(id, rect, false)
+    }
+
+    #[wasm_bindgen(js_name = exportLayerMask, unchecked_return_type = "Promise<Uint8Array>")]
+    pub fn export_layer_mask(
+        &mut self,
+        id: LayerId,
+        #[wasm_bindgen(unchecked_optional_param_type = "PixelRect")] rect: Option<JsValue>,
+    ) -> Promise {
+        self.export_layer_pixels(id, rect, true)
+    }
+
+    fn export_layer_pixels(&mut self, id: LayerId, rect: Option<JsValue>, alpha: bool) -> Promise {
+        let readback = optional_rect(rect).and_then(|rect| {
+            self.session
+                .borrow_mut()
+                .engine
+                .read_layer(id, rect)
+                .map_err(|error| JsError::from(error).into())
+        });
+        export_pixels_js(readback, alpha)
+    }
+
+    #[wasm_bindgen(js_name = pickColor, unchecked_return_type = "Promise<Uint8Array>")]
+    pub fn pick_color(&mut self, x: u32, y: u32) -> Promise {
+        let rect = PixelRect {
+            x,
+            y,
+            width: 1,
+            height: 1,
+        };
+        export_pixels(
+            self.session.borrow_mut().engine.read_region(Some(rect)),
+            false,
+        )
+    }
+
+    #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
+    pub fn fill(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "FillOptions")] options: JsValue,
+    ) -> Promise {
+        let fill = from_js::<FillOptions>(&options).and_then(|options| {
+            self.session
+                .borrow_mut()
+                .engine
+                .fill(
+                    options.id,
+                    (options.x, options.y),
+                    options.color,
+                    options.tolerance,
+                )
+                .map_err(|error| JsError::from(error).into())
+        });
+        let session = Rc::downgrade(&self.session);
         future_to_promise(async move {
-            let readback = readback.map_err(JsError::from)?;
-            let pixels = readback.pixels().await.map_err(JsError::from)?;
-            Ok(Uint8Array::from(pixels.as_slice()).into())
+            let result = fill?.prepare().await.map_err(JsError::from)?;
+            let session = session
+                .upgrade()
+                .ok_or_else(|| JsError::new("The editor was closed."))?;
+            session
+                .borrow_mut()
+                .engine
+                .commit_fill(result)
+                .map_err(JsError::from)?;
+            Ok(JsValue::UNDEFINED)
         })
+    }
+
+    #[wasm_bindgen(js_name = documentPoint, unchecked_return_type = "Point")]
+    pub fn document_point(&self, x: f32, y: f32) -> Result<JsValue, JsValue> {
+        to_js(&self.session.borrow().viewport.to_document(Point::new(x, y)))
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -229,15 +396,47 @@ impl Editor {
         &mut self,
         #[wasm_bindgen(unchecked_param_type = "Brush")] brush: JsValue,
     ) -> Result<(), JsValue> {
-        self.session.borrow_mut().brush = from_js(&brush)?;
+        let brush: Brush = from_js(&brush)?;
+        if !brush.is_valid() {
+            return Err(JsError::from(EngineError::InvalidBrush).into());
+        }
+        self.session.borrow_mut().brush = brush;
         Ok(())
+    }
+
+    #[wasm_bindgen(js_name = brushPreset, unchecked_return_type = "Brush")]
+    pub fn brush_preset(
+        #[wasm_bindgen(unchecked_param_type = "BrushPreset")] preset: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        to_js(&from_js::<BrushPreset>(&preset)?.brush())
+    }
+
+    #[wasm_bindgen(js_name = setBrushDynamics)]
+    pub fn set_brush_dynamics(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "BrushDynamics")] dynamics: JsValue,
+    ) -> Result<(), JsValue> {
+        let dynamics: BrushDynamics = from_js(&dynamics)?;
+        if !dynamics.is_valid() {
+            return Err(JsError::from(EngineError::InvalidBrush).into());
+        }
+        self.session.borrow_mut().dynamics = dynamics;
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = setEraser)]
+    pub fn set_eraser(&mut self, erase: bool) {
+        self.session.borrow_mut().erase = erase;
     }
 
     #[wasm_bindgen(js_name = beginStroke)]
     pub fn begin_stroke(&mut self, x: f32, y: f32, pressure: f32) -> Result<(), JsError> {
         let mut session = self.session.borrow_mut();
-        let (brush, point) = (session.brush, session.stroke_point(x, y, pressure));
-        Ok(session.engine.begin_stroke(brush, point)?)
+        let (brush, dynamics, erase) = (session.brush, session.dynamics, session.erase);
+        let point = session.stroke_point(x, y, pressure);
+        Ok(session
+            .engine
+            .begin_brush_stroke(brush, dynamics, erase, point)?)
     }
 
     #[wasm_bindgen(js_name = extendStroke)]
@@ -319,6 +518,27 @@ impl Drop for Editor {
     fn drop(&mut self) {
         self.listeners.borrow_mut().clear();
     }
+}
+
+fn optional_rect(rect: Option<JsValue>) -> Result<Option<PixelRect>, JsValue> {
+    rect.as_ref().map(from_js).transpose()
+}
+
+fn export_pixels(readback: Result<Readback, EngineError>, alpha: bool) -> Promise {
+    export_pixels_js(readback.map_err(|error| JsError::from(error).into()), alpha)
+}
+
+fn export_pixels_js(readback: Result<Readback, JsValue>, alpha: bool) -> Promise {
+    future_to_promise(async move {
+        let mut pixels = readback?.pixels().await.map_err(JsError::from)?;
+        if alpha {
+            for index in 0..pixels.len() / 4 {
+                pixels[index] = pixels[index * 4 + 3];
+            }
+            pixels.truncate(pixels.len() / 4);
+        }
+        Ok(Uint8Array::from(pixels.as_slice()).into())
+    })
 }
 
 async fn deliver_events(mut events: UnboundedReceiver<Event>, listeners: Listeners) {
