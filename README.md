@@ -77,7 +77,7 @@ Vite apps must add `nijimi` to `optimizeDeps.exclude`, otherwise the dev server 
 - Groups are isolated: their layers blend with each other first, then the group blends with what is below it.
 - Colors and pixels use sRGB values, and layers blend in that space.
 - Events arrive after the call that caused them. On `documentReplaced`, read `state()` again.
-- Undo keeps replaced tiles, up to 256 MB by default. `setHistoryLimit(bytes)` changes that.
+- Undo keeps replaced tiles, up to 256 MB by default. `setHistoryLimit(bytes)` changes that. The latest change stays undoable even when it is larger than the limit, unless the limit is 0.
 - `free()` releases the GPU memory.
 
 ### Editing tools

@@ -151,7 +151,8 @@ impl<T> History<T> {
     }
 
     fn trim(&mut self) {
-        while self.bytes > self.limit {
+        let kept = usize::from(self.limit > 0);
+        while self.bytes > self.limit && self.undo.len() + self.redo.len() > kept {
             let Some(oldest) = self.undo.pop_front().or_else(|| self.redo.pop_front()) else {
                 return;
             };

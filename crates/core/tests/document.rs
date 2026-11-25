@@ -343,3 +343,17 @@ fn events_describe_each_change() {
         ]
     );
 }
+
+#[test]
+fn the_latest_change_stays_undoable_when_it_exceeds_the_limit() {
+    let mut document = sample();
+    document.set_history_limit(TILE);
+    let before = state(&document);
+    document.delete_layer(BOTTOM).unwrap();
+    assert!(document.history_bytes() > TILE);
+    assert!(document.undo());
+    assert_eq!(state(&document), before);
+    assert!(document.redo());
+    document.rename_layer(GROUP, "Renamed".into()).unwrap();
+    assert!(document.history_bytes() <= TILE);
+}
