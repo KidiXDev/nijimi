@@ -1723,3 +1723,123 @@ fn rotated_layers_have_no_holes_at_tile_borders() {
         .count();
     assert_eq!(holes, 0);
 }
+
+#[test]
+fn adjustments_match_reference_values() {
+    use Adjustment::*;
+    let cases = [
+        (
+            BrightnessContrast {
+                brightness: 0.1,
+                contrast: 0.25,
+            },
+            vec![((0, 0), [71, 158, 239])],
+        ),
+        (
+            Levels {
+                black: 0.05,
+                white: 0.6,
+                gamma: 1.5,
+                output_black: 0.1,
+                output_white: 0.8,
+            },
+            vec![((0, 0), [94, 172, 223])],
+        ),
+        (
+            Curves {
+                points: vec![
+                    Point::new(0.0, 0.0),
+                    Point::new(0.25, 0.5),
+                    Point::new(1.0, 0.9),
+                ],
+            },
+            vec![((0, 0), [90, 176, 210])],
+        ),
+        (
+            Hsl {
+                hue: 90.0,
+                saturation: 0.2,
+                lightness: 0.1,
+            },
+            vec![((0, 0), [220, 15, 204])],
+        ),
+        (
+            Hsl {
+                hue: -60.0,
+                saturation: -0.5,
+                lightness: -0.3,
+            },
+            vec![((0, 0), [97, 146, 131])],
+        ),
+        (
+            ColorBalance {
+                shadows: [0.3, 0.0, -0.2],
+                midtones: [0.0, 0.2, 0.0],
+                highlights: [0.1, 0.0, 0.4],
+            },
+            vec![((0, 0), [108, 137, 183])],
+        ),
+        (
+            Vignette {
+                amount: 0.8,
+                radius: 0.2,
+                feather: 0.6,
+            },
+            vec![
+                ((0, 0), [26, 59, 91]),
+                ((30, 30), [47, 97, 147]),
+                ((19, 10), [60, 122, 183]),
+            ],
+        ),
+        (
+            Grain {
+                amount: 0.8,
+                seed: 42,
+            },
+            vec![((0, 0), [0, 110, 182]), ((7, 3), [0, 108, 181])],
+        ),
+    ];
+    let mut editor = Editor::new((40, 40));
+    for (adjustment, expected) in cases {
+        editor
+            .engine
+            .load_rgba(40, 40, &[64, 128, 192, 255].repeat(1600))
+            .unwrap();
+        add_adjustment(&mut editor, adjustment.clone());
+        for ((x, y), [red, green, blue]) in expected {
+            let actual = editor.pixel(x, y);
+            let near = actual
+                .iter()
+                .zip([red, green, blue, 255])
+                .all(|(a, b)| a.abs_diff(b) <= 1);
+            assert!(near, "{adjustment:?} at {x}, {y}: {actual:?}");
+        }
+    }
+}
+
+#[test]
+fn blur_and_sharpen_match_reference_values_across_a_tile_border() {
+    let mut editor = Editor::new((512, 8));
+    let edge: Vec<u8> = (0..512 * 8)
+        .flat_map(|index| {
+            let value = if index % 512 < 256 { 64 } else { 192 };
+            [value, value, value, 255]
+        })
+        .collect();
+    for (adjustment, expected) in [
+        (
+            Adjustment::Blur { radius: 4 },
+            vec![(250, 64), (253, 87), (255, 135), (256, 157), (258, 185)],
+        ),
+        (
+            Adjustment::Sharpen { amount: 0.7 },
+            vec![(254, 64), (255, 0), (256, 205)],
+        ),
+    ] {
+        editor.engine.load_rgba(512, 8, &edge).unwrap();
+        add_adjustment(&mut editor, adjustment);
+        for (x, value) in expected {
+            assert_near(&editor.pixel(x, 4), &[value, value, value, 255], 1);
+        }
+    }
+}
