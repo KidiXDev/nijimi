@@ -63,7 +63,6 @@ pub(crate) struct Composite {
     texture: wgpu::Texture,
     mipmaps: Vec<Mipmap>,
     present_bindings: wgpu::BindGroup,
-    export_bindings: wgpu::BindGroup,
     scratch: Vec<TileRef>,
 }
 
@@ -106,12 +105,10 @@ impl Composite {
                 view_buffer.as_entire_binding(),
             ],
         );
-        let export_bindings = gpu.bind(&gpu.layouts.image, &[TextureView(&full_view)]);
         Self {
             texture,
             mipmaps,
             present_bindings,
-            export_bindings,
             scratch: Vec::new(),
         }
     }
@@ -120,8 +117,12 @@ impl Composite {
         &self.present_bindings
     }
 
-    pub fn export_bindings(&self) -> &wgpu::BindGroup {
-        &self.export_bindings
+    pub fn size(&self) -> (u32, u32) {
+        self.mipmaps[0].size
+    }
+
+    pub fn view(&self) -> &wgpu::TextureView {
+        &self.mipmaps[0].view
     }
 
     pub fn update(

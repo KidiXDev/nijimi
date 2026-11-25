@@ -1,4 +1,4 @@
-import type { BlendMode, Command, EditorState, LayerState } from '../pkg/nijimi.js';
+import type { BlendMode, Command, EditorState, LayerState, PreviewCommand } from '../pkg/nijimi.js';
 import { element } from './dom';
 
 type Position = { parent: LayerState | null; siblings: LayerState[]; index: number };
@@ -48,7 +48,9 @@ function outOf(state: EditorState, group: LayerState, offset: number) {
 
 export function createLayerPanel(
   readState: () => EditorState,
-  dispatch: (command: Command) => void
+  dispatch: (command: Command) => void,
+  preview: (command: PreviewCommand) => void,
+  commitPreview: () => void
 ) {
   function active() {
     const state = readState();
@@ -134,11 +136,15 @@ export function createLayerPanel(
     id,
     blendMode: blendSelect.value as BlendMode
   }));
-  changeActive('change', opacityInput, (id) => ({
-    type: 'setLayerOpacity',
-    id,
-    opacity: opacityInput.valueAsNumber
-  }));
+  opacityInput.addEventListener('input', () => {
+    const current = active();
+    if (current) preview({
+      type: 'setLayerOpacity',
+      id: current.layer.id,
+      opacity: opacityInput.valueAsNumber
+    });
+  });
+  opacityInput.addEventListener('change', commitPreview);
 
   return { update };
 }

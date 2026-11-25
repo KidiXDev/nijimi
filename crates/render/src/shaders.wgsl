@@ -27,20 +27,42 @@ fn import_vertex(
     return TileVertex(fullscreen_corner(index),vec2i(coord) * TILE_SIZE);
 }
 
+@group(0) @binding(1) var<uniform> image_origin: vec4i;
+
 @fragment
 fn import_fragment(in: TileVertex) -> @location(0) vec4f {
-    let pixel = vec2i(in.position.xy) + in.origin;
-    if any(pixel >= vec2i(textureDimensions(source))) {
+    let pixel = vec2i(in.position.xy) + in.origin - image_origin.xy;
+    if any(pixel < vec2i(0)) || any(pixel >= vec2i(textureDimensions(source))) {
         return vec4f(0.0);
     }
     let texel = textureLoad(source, pixel, 0);
     return vec4f(texel.rgb * texel.a, texel.a);
 }
 
+struct Resample {
+    x: vec2f,
+    y: vec2f,
+    offset: vec2f,
+    size: vec2f,
+}
+
+@group(0) @binding(1) var<uniform> resample: Resample;
+
+@fragment
+fn resample_fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
+    let pixel = vec2f(dot(resample.x, position.xy), dot(resample.y, position.xy)) + resample.offset;
+    if any(pixel < vec2f(0.0)) || any(pixel >= resample.size) {
+        discard;
+    }
+    return textureLoad(source, vec2i(pixel), 0);
+}
+
 // Export
+@group(0) @binding(1) var<uniform> export_origin: vec4i;
+
 @fragment
 fn export_fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
-    let texel = textureLoad(source, vec2i(position.xy), 0);
+    let texel = textureLoad(source, vec2i(position.xy) + export_origin.xy, 0);
     return vec4f(texel.rgb / max(texel.a, 1e-5), texel.a);
 }
 
@@ -85,6 +107,13 @@ fn stroke_fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
     let pixel = vec2i(position.xy);
     let alpha = textureLoad(coverage, pixel, 0).r * paint.opacity;
     return vec4f(paint.color * alpha, alpha) + textureLoad(source, pixel, 0) * (1.0 - alpha);
+}
+
+@fragment
+fn erase_fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
+    let pixel = vec2i(position.xy);
+    let alpha = textureLoad(coverage, pixel, 0).r * paint.opacity;
+    return textureLoad(source, pixel, 0) * (1.0 - alpha);
 }
 
 // Layer compositing

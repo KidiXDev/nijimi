@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, error::Error, fmt, mem};
 
 use crate::{
     BlendMode, DEFAULT_HISTORY_LIMIT, Event, Layer, LayerContent, LayerId, LayerProperties,
-    MAX_NAME_LENGTH, TileCoord, find_layer,
+    MAX_NAME_LENGTH, RasterEdit, TileCoord, Tiles, find_layer,
     history::{Edit, Entry, History},
 };
 
@@ -19,6 +19,8 @@ pub enum DocumentError {
     TooDeep,
     NameTooLong,
     InvalidOpacity,
+    InvalidSize,
+    DuplicateTileEdit(LayerId),
     DuplicateLayer(LayerId),
     TileOutOfBounds(TileCoord),
 }
@@ -49,6 +51,10 @@ impl fmt::Display for DocumentError {
                 )
             }
             Self::InvalidOpacity => write!(formatter, "Opacity must be between 0 and 1."),
+            Self::InvalidSize => write!(formatter, "Canvas dimensions must be positive."),
+            Self::DuplicateTileEdit(id) => {
+                write!(formatter, "Layer {id} has duplicate tile edits.")
+            }
             Self::DuplicateLayer(id) => write!(formatter, "Layer {id} appears twice."),
             Self::TileOutOfBounds(TileCoord { x, y }) => {
                 write!(formatter, "Tile {x}, {y} is outside the document.")
@@ -133,6 +139,22 @@ impl<T: Clone> Document<T> {
         })
     }
 
+    pub fn fork_for_preview(&self) -> Self {
+        let mut preview = Self::new(self.size);
+        preview.layers = self.layers.clone();
+        preview.active = self.active;
+        preview.next_id = self.next_id;
+        preview.dirty = self.dirty.clone();
+        preview.history.set_limit(0);
+        preview
+    }
+
+    pub fn mark_all_dirty(&mut self) {
+        for layer in &self.layers {
+            self.dirty.extend(tile_coords(layer));
+        }
+    }
+
     pub fn size(&self) -> (u32, u32) {
         self.size
     }
@@ -186,8 +208,19 @@ impl<T: Clone> Document<T> {
         name: Option<String>,
         place: Option<LayerPlace>,
     ) -> Result<LayerId, DocumentError> {
+        self.add_raster(name, place, Tiles::new())
+    }
+
+    pub fn add_raster(
+        &mut self,
+        name: Option<String>,
+        place: Option<LayerPlace>,
+        tiles: Tiles<T>,
+    ) -> Result<LayerId, DocumentError> {
         let name = name.unwrap_or_else(|| format!("Layer {}", self.next_id));
-        let layer = Layer::raster(self.next_id, name);
+        let mut layer = Layer::raster(self.next_id, name);
+        layer.content = LayerContent::Raster(tiles);
+        check_layer(&layer, self.size)?;
         self.insert(layer, place)
     }
 
@@ -274,14 +307,66 @@ impl<T: Clone> Document<T> {
         id: LayerId,
         tiles: Vec<(TileCoord, Option<T>)>,
     ) -> Result<(), DocumentError> {
-        if self.layer(id)?.tiles().is_none() {
-            return Err(DocumentError::NotARasterLayer(id));
+        self.replace_rasters(self.size, vec![(id, tiles)])
+    }
+
+    pub fn replace_rasters(
+        &mut self,
+        size: (u32, u32),
+        mut layers: Vec<RasterEdit<T>>,
+    ) -> Result<(), DocumentError> {
+        if size.0 == 0 || size.1 == 0 {
+            return Err(DocumentError::InvalidSize);
         }
-        if let Some((coord, _)) = tiles.iter().find(|(coord, _)| !coord.is_inside(self.size)) {
-            return Err(DocumentError::TileOutOfBounds(*coord));
+        let mut touched = BTreeSet::new();
+        for (id, tiles) in &mut layers {
+            let current = self
+                .layer(*id)?
+                .tiles()
+                .ok_or(DocumentError::NotARasterLayer(*id))?;
+            if !touched.insert(*id) {
+                return Err(DocumentError::DuplicateTileEdit(*id));
+            }
+            let mut coords = BTreeSet::new();
+            for (coord, tile) in tiles.iter() {
+                if !coords.insert(*coord) {
+                    return Err(DocumentError::DuplicateTileEdit(*id));
+                }
+                let bounds = if tile.is_some() { size } else { self.size };
+                if !coord.is_inside(bounds) {
+                    return Err(DocumentError::TileOutOfBounds(*coord));
+                }
+            }
+            if size.0 < self.size.0 || size.1 < self.size.1 {
+                tiles.extend(
+                    current
+                        .keys()
+                        .filter(|coord| !coord.is_inside(size) && !coords.contains(coord))
+                        .map(|coord| (*coord, None)),
+                );
+            }
         }
-        if !tiles.is_empty() {
-            self.observed(|document| document.commit(Edit::Tiles { id, tiles }));
+        if size.0 < self.size.0 || size.1 < self.size.1 {
+            for layer in &self.layers {
+                layer.visit(&mut |layer| {
+                    if !touched.contains(&layer.id)
+                        && let Some(tiles) = layer.tiles()
+                    {
+                        layers.push((
+                            layer.id,
+                            tiles
+                                .keys()
+                                .filter(|coord| !coord.is_inside(size))
+                                .map(|coord| (*coord, None))
+                                .collect(),
+                        ));
+                    }
+                });
+            }
+        }
+        layers.retain(|(_, tiles)| !tiles.is_empty());
+        if self.size != size || !layers.is_empty() {
+            self.observed(|document| document.commit(Edit::Rasters { size, layers }));
         }
         Ok(())
     }
@@ -433,25 +518,45 @@ impl<T: Clone> Document<T> {
                     properties: previous,
                 }
             }
-            Edit::Tiles { id, tiles } => {
-                self.mark_dirty(tiles.iter().map(|(coord, _)| *coord));
-                let LayerContent::Raster(current) = &mut self.layer_mut(id).content else {
-                    unreachable!("tile edits are only recorded for raster layers");
-                };
-                let previous = tiles
+            Edit::Rasters { size, layers } => {
+                let old_size = mem::replace(&mut self.size, size);
+                let layers = layers
                     .into_iter()
-                    .map(|(coord, tile)| {
-                        let previous = match tile {
-                            Some(tile) => current.insert(coord, tile),
-                            None => current.remove(&coord),
+                    .map(|(id, tiles)| {
+                        self.mark_dirty(
+                            tiles
+                                .iter()
+                                .map(|(coord, _)| *coord)
+                                .filter(|coord| coord.is_inside(size)),
+                        );
+                        let LayerContent::Raster(current) = &mut self.layer_mut(id).content else {
+                            unreachable!("tile edits are only recorded for raster layers");
                         };
-                        (coord, previous)
+                        let previous = tiles
+                            .into_iter()
+                            .map(|(coord, tile)| {
+                                let previous = match tile {
+                                    Some(tile) => current.insert(coord, tile),
+                                    None => current.remove(&coord),
+                                };
+                                (coord, previous)
+                            })
+                            .collect();
+                        self.events.push(Event::PixelsChanged { id });
+                        (id, previous)
                     })
                     .collect();
-                self.events.push(Event::PixelsChanged { id });
-                Edit::Tiles {
-                    id,
-                    tiles: previous,
+                if old_size != size {
+                    self.dirty.retain(|coord| coord.is_inside(size));
+                    self.mark_all_dirty();
+                    self.events.push(Event::CanvasResized {
+                        width: size.0,
+                        height: size.1,
+                    });
+                }
+                Edit::Rasters {
+                    size: old_size,
+                    layers,
                 }
             }
         }

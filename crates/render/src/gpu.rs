@@ -21,6 +21,8 @@ pub(crate) const IMAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8U
 
 pub(crate) struct Layouts {
     pub image: wgpu::BindGroupLayout,
+    pub resample: wgpu::BindGroupLayout,
+    pub export: wgpu::BindGroupLayout,
     pub stroke: wgpu::BindGroupLayout,
     pub composite: wgpu::BindGroupLayout,
     pub mipmap: wgpu::BindGroupLayout,
@@ -29,6 +31,8 @@ pub(crate) struct Layouts {
 
 pub(crate) struct Pipelines {
     pub import: wgpu::RenderPipeline,
+    pub erase: wgpu::RenderPipeline,
+    pub resample: wgpu::RenderPipeline,
     pub export: wgpu::RenderPipeline,
     pub dab: wgpu::RenderPipeline,
     pub stroke: wgpu::RenderPipeline,
@@ -245,7 +249,9 @@ fn create_layouts(device: &wgpu::Device) -> Layouts {
     let mut composite = vec![texture; 1 + LAYERS_PER_PASS];
     composite.push(uniform(true));
     Layouts {
-        image: layout("image", &[texture]),
+        image: layout("image", &[texture, uniform(false)]),
+        resample: layout("resample", &[texture, uniform(false)]),
+        export: layout("export", &[texture, uniform(false)]),
         stroke: layout("stroke", &[texture, texture, uniform(false)]),
         composite: layout("composite", &composite),
         mipmap: layout("mipmap", &[texture, sampler]),
@@ -279,7 +285,13 @@ fn create_pipelines(
             vertex: "import_vertex",
             ..fullscreen("import_fragment", TILE_FORMAT, &layouts.image)
         }),
-        export: build(fullscreen("export_fragment", IMAGE_FORMAT, &layouts.image)),
+        export: build(fullscreen("export_fragment", IMAGE_FORMAT, &layouts.export)),
+        resample: build(fullscreen(
+            "resample_fragment",
+            TILE_FORMAT,
+            &layouts.resample,
+        )),
+        erase: build(fullscreen("erase_fragment", TILE_FORMAT, &layouts.stroke)),
         dab: build(PipelineSpec {
             vertex: "dab_vertex",
             fragment: "dab_fragment",

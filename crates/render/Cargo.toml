@@ -10,6 +10,7 @@ nijimi-core.workspace = true
 wgpu.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
 futures-channel.workspace = true
+half = "2"
 
 [dev-dependencies]
 pollster = "0.4"

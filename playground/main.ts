@@ -121,7 +121,12 @@ async function main() {
     layerPanel.update();
   }
 
-  const layerPanel = createLayerPanel(() => editor.state(), dispatch);
+  const layerPanel = createLayerPanel(
+    () => editor.state(),
+    dispatch,
+    (command) => attempt(() => editor.preview(command)),
+    () => attempt(() => editor.commitPreview())
+  );
 
   function updatePanels() {
     const { canUndo, canRedo } = editor.state();
@@ -185,13 +190,18 @@ async function main() {
       autoFit = false;
       editor.panBy(event.movementX * devicePixelRatio, event.movementY * devicePixelRatio);
     } else {
-      const samples = event.getCoalescedEvents();
+      const samples = event.getCoalescedEvents?.() ?? [];
       for (const sample of samples.length ? samples : [event]) {
         const { x, y } = canvasPoint(sample);
         editor.extendStroke(x, y, pressure(sample));
       }
     }
     requestRender();
+  });
+
+  canvas.addEventListener('pointercancel', () => {
+    if (gesture === 'paint') attempt(() => editor.cancelStroke());
+    gesture = null;
   });
 
   canvas.addEventListener('lostpointercapture', () => {
@@ -212,9 +222,12 @@ async function main() {
   );
 
   addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && gesture === 'paint') {
-      gesture = null;
-      attempt(() => editor.cancelStroke());
+    if (event.key === 'Escape') {
+      if (gesture === 'paint') {
+        gesture = null;
+        attempt(() => editor.cancelStroke());
+      }
+      attempt(() => editor.cancelPreview());
       return;
     }
     if (!(event.ctrlKey || event.metaKey) || event.target instanceof HTMLInputElement) return;

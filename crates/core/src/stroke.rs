@@ -40,6 +40,65 @@ impl Brush {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BrushDynamics {
+    pub pressure_curve: PressureCurve,
+    pub stabilizer: f32,
+}
+
+impl BrushDynamics {
+    pub fn is_valid(self) -> bool {
+        (0.0..=0.95).contains(&self.stabilizer)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PressureCurve {
+    #[default]
+    Linear,
+    Soft,
+    Firm,
+    Fixed,
+}
+
+impl PressureCurve {
+    fn apply(self, value: f32) -> f32 {
+        let value = value.clamp(0.0, 1.0);
+        match self {
+            Self::Linear => value,
+            Self::Soft => value.sqrt(),
+            Self::Firm => value * value,
+            Self::Fixed => 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BrushPreset {
+    Pencil,
+    Round,
+    Airbrush,
+}
+
+impl BrushPreset {
+    pub fn brush(self) -> Brush {
+        let (diameter, hardness, flow) = match self {
+            Self::Pencil => (5.0, 1.0, 1.0),
+            Self::Round => (64.0, 0.85, 1.0),
+            Self::Airbrush => (128.0, 0.0, 0.12),
+        };
+        Brush {
+            diameter,
+            hardness,
+            flow,
+            ..Brush::default()
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
 pub struct StrokePoint {
     #[serde(flatten)]
@@ -98,15 +157,27 @@ fn tile_range(center: f32, radius: f32, length: u32) -> std::ops::Range<u32> {
 #[derive(Clone, Debug)]
 pub struct Stroke {
     brush: Brush,
+    dynamics: BrushDynamics,
     last: StrokePoint,
+    input: StrokePoint,
     until_next_dab: f32,
 }
 
 impl Stroke {
     pub fn begin(brush: Brush, start: StrokePoint) -> (Self, Dab) {
+        Self::with_dynamics(brush, BrushDynamics::default(), start)
+    }
+
+    pub fn with_dynamics(brush: Brush, dynamics: BrushDynamics, start: StrokePoint) -> (Self, Dab) {
+        let start = StrokePoint {
+            pressure: start.pressure.clamp(0.0, 1.0),
+            ..start
+        };
         let mut stroke = Self {
             brush,
+            dynamics,
             last: start,
+            input: start,
             until_next_dab: 0.0,
         };
         stroke.until_next_dab = stroke.spacing(start.pressure);
@@ -118,6 +189,34 @@ impl Stroke {
         if !next.is_valid() {
             return;
         }
+        self.input = StrokePoint {
+            pressure: next.pressure.clamp(0.0, 1.0),
+            ..next
+        };
+        let strength = self.dynamics.stabilizer;
+        let mix = |last: f32, next: f32| next + (last - next) * strength;
+        self.line_to(
+            StrokePoint {
+                position: Point::new(
+                    mix(self.last.position.x, next.position.x),
+                    mix(self.last.position.y, next.position.y),
+                ),
+                pressure: mix(self.last.pressure, self.input.pressure),
+            },
+            dabs,
+        );
+    }
+
+    pub fn complete(&mut self, dabs: &mut Vec<Dab>) {
+        if self.last.position != self.input.position {
+            self.line_to(self.input, dabs);
+            if self.until_next_dab < self.spacing(self.input.pressure) {
+                dabs.push(self.dab(self.input));
+            }
+        }
+    }
+
+    fn line_to(&mut self, next: StrokePoint, dabs: &mut Vec<Dab>) {
         let dx = next.position.x - self.last.position.x;
         let dy = next.position.y - self.last.position.y;
         let length = dx.hypot(dy);
@@ -137,7 +236,7 @@ impl Stroke {
     }
 
     fn diameter(&self, pressure: f32) -> f32 {
-        (self.brush.diameter * pressure.clamp(0.0, 1.0)).max(MIN_DIAMETER)
+        (self.brush.diameter * self.dynamics.pressure_curve.apply(pressure)).max(MIN_DIAMETER)
     }
 
     fn spacing(&self, pressure: f32) -> f32 {
@@ -230,6 +329,48 @@ mod tests {
         );
         assert_eq!(first.radius, MIN_DIAMETER / 2.0);
         assert_eq!(dabs.len(), 20);
+    }
+
+    #[test]
+    fn pressure_curves_change_diameter_and_stabilizing_preserves_the_endpoint() {
+        let brush = Brush {
+            diameter: 100.0,
+            ..Brush::default()
+        };
+        let point = StrokePoint {
+            pressure: 0.25,
+            ..at(0.5, 0.5)
+        };
+        for (curve, radius) in [
+            (PressureCurve::Linear, 12.5),
+            (PressureCurve::Soft, 25.0),
+            (PressureCurve::Firm, 3.125),
+            (PressureCurve::Fixed, 50.0),
+        ] {
+            let (_, dab) = Stroke::with_dynamics(
+                brush,
+                BrushDynamics {
+                    pressure_curve: curve,
+                    stabilizer: 0.0,
+                },
+                point,
+            );
+            assert_eq!(dab.radius, radius);
+        }
+        let (mut stroke, _) = Stroke::with_dynamics(
+            brush,
+            BrushDynamics {
+                stabilizer: 0.5,
+                ..BrushDynamics::default()
+            },
+            at(0.0, 0.0),
+        );
+        let mut dabs = Vec::new();
+        let end = at(101.0, 0.0);
+        stroke.extend(end, &mut dabs);
+        assert!(dabs.last().unwrap().center.x < end.position.x);
+        stroke.complete(&mut dabs);
+        assert_eq!(dabs.last().unwrap().center, end.position);
     }
 
     #[test]

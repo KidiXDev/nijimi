@@ -11,6 +11,11 @@ pub enum EngineError {
     NoActiveLayer,
     InvalidBrush,
     InvalidStroke,
+    InvalidRegion,
+    InvalidTransform,
+    UnsupportedPreview,
+    InvalidFill,
+    StaleFill,
     Document(DocumentError),
     Project(ProjectError),
     OutOfGpuMemory,
@@ -33,6 +38,14 @@ impl fmt::Display for EngineError {
             }
             Self::NoActiveLayer => write!(formatter, "No layer is selected."),
             Self::InvalidBrush => write!(formatter, "A brush value is out of range."),
+            Self::InvalidRegion => write!(formatter, "The region must lie inside the canvas."),
+            Self::InvalidTransform => write!(formatter, "A transform value is out of range."),
+            Self::UnsupportedPreview => write!(formatter, "This command cannot be previewed."),
+            Self::InvalidFill => write!(formatter, "Fill color or tolerance is out of range."),
+            Self::StaleFill => write!(
+                formatter,
+                "The document changed while the fill was running."
+            ),
             Self::InvalidStroke => write!(formatter, "A stroke point is out of range."),
             Self::Document(error) => error.fmt(formatter),
             Self::Project(error) => error.fmt(formatter),
