@@ -1,8 +1,9 @@
-use std::{collections::BTreeSet, error::Error, fmt, mem};
+use std::{collections::BTreeSet, error::Error, fmt, mem, sync::Arc};
 
 use crate::{
     Adjustment, BlendMode, DEFAULT_HISTORY_LIMIT, Event, Layer, LayerContent, LayerId, LayerMask,
-    LayerProperties, MAX_NAME_LENGTH, RasterEdit, TileCoord, Tiles, find_layer,
+    LayerProperties, MAX_NAME_LENGTH, MAX_SELECTION_RADIUS, PlaneEdit, RasterEdit, Selection,
+    SelectionMode, TextSettings, TileCoord, Tiles, find_layer,
     history::{Edit, Entry, History},
 };
 
@@ -15,6 +16,12 @@ pub enum DocumentError {
     NotAGroup(LayerId),
     NotARasterLayer(LayerId),
     NotAnAdjustment(LayerId),
+    TextLayer(LayerId),
+    NotAText(LayerId),
+    InvalidText,
+    NoSelection,
+    EmptySelection,
+    InvalidSelection,
     NoMask(LayerId),
     MaskExists(LayerId),
     InvalidAdjustment,
@@ -38,6 +45,14 @@ impl fmt::Display for DocumentError {
             Self::NotAnAdjustment(id) => {
                 write!(formatter, "Layer {id} is not an adjustment layer.")
             }
+            Self::TextLayer(id) => {
+                write!(formatter, "Layer {id} is a text layer. Rasterize it first.")
+            }
+            Self::NotAText(id) => write!(formatter, "Layer {id} is not a text layer."),
+            Self::InvalidText => write!(formatter, "A text setting is out of range."),
+            Self::NoSelection => write!(formatter, "Nothing is selected."),
+            Self::EmptySelection => write!(formatter, "No pixels would be selected."),
+            Self::InvalidSelection => write!(formatter, "A selection value is out of range."),
             Self::NoMask(id) => write!(formatter, "Layer {id} has no mask."),
             Self::MaskExists(id) => write!(formatter, "Layer {id} already has a mask."),
             Self::InvalidAdjustment => {
@@ -97,6 +112,7 @@ pub struct Document<T> {
     size: (u32, u32),
     layers: Vec<Layer<T>>,
     active: Option<LayerId>,
+    selection: Option<Arc<Selection>>,
     next_id: LayerId,
     history: History<T>,
     dirty: BTreeSet<TileCoord>,
@@ -109,6 +125,7 @@ impl<T: Clone> Document<T> {
             size,
             layers: Vec::new(),
             active: None,
+            selection: None,
             next_id: 1,
             history: History::new(DEFAULT_HISTORY_LIMIT),
             dirty: BTreeSet::new(),
@@ -164,6 +181,7 @@ impl<T: Clone> Document<T> {
         let mut preview = Self::new(self.size);
         preview.layers = self.layers.clone();
         preview.active = self.active;
+        preview.selection = self.selection.clone();
         preview.next_id = self.next_id;
         preview.dirty = self.dirty.clone();
         preview.history.set_limit(0);
@@ -190,6 +208,18 @@ impl<T: Clone> Document<T> {
 
     pub fn active(&self) -> Option<LayerId> {
         self.active
+    }
+
+    pub fn selection(&self) -> Option<&Arc<Selection>> {
+        self.selection.as_ref()
+    }
+
+    pub fn paintable(&self, id: LayerId) -> Result<&Tiles<T>, DocumentError> {
+        let layer = self.layer(id)?;
+        if layer.text.is_some() {
+            return Err(DocumentError::TextLayer(id));
+        }
+        layer.tiles().ok_or(DocumentError::NotARasterLayer(id))
     }
 
     pub fn can_undo(&self) -> bool {
@@ -239,10 +269,126 @@ impl<T: Clone> Document<T> {
         tiles: Tiles<T>,
     ) -> Result<LayerId, DocumentError> {
         let name = name.unwrap_or_else(|| format!("Layer {}", self.next_id));
+        self.insert_raster(name, place, tiles, None)
+    }
+
+    pub fn add_text(
+        &mut self,
+        name: Option<String>,
+        place: Option<LayerPlace>,
+        text: TextSettings,
+        tiles: Tiles<T>,
+    ) -> Result<LayerId, DocumentError> {
+        let name = name.unwrap_or_else(|| format!("Text {}", self.next_id));
+        self.insert_raster(name, place, tiles, Some(text))
+    }
+
+    fn insert_raster(
+        &mut self,
+        name: String,
+        place: Option<LayerPlace>,
+        tiles: Tiles<T>,
+        text: Option<TextSettings>,
+    ) -> Result<LayerId, DocumentError> {
         let mut layer = Layer::raster(self.next_id, name);
         layer.content = LayerContent::Raster(tiles);
+        layer.text = text;
         check_layer(&layer, self.size)?;
         self.insert(layer, place)
+    }
+
+    pub fn set_text(
+        &mut self,
+        id: LayerId,
+        text: TextSettings,
+        tiles: Tiles<T>,
+    ) -> Result<(), DocumentError> {
+        let layer = self.layer(id)?;
+        let before = layer.tiles().filter(|_| layer.text.is_some());
+        let before = before.ok_or(DocumentError::NotAText(id))?;
+        let mut changes: Vec<_> = before
+            .keys()
+            .filter(|coord| !tiles.contains_key(coord))
+            .map(|coord| (*coord, None))
+            .collect();
+        changes.extend(tiles.into_iter().map(|(coord, tile)| (coord, Some(tile))));
+        self.replace_planes(PlaneEdit {
+            rasters: vec![(id, changes)],
+            texts: vec![(id, Some(text))],
+            ..PlaneEdit::new(self.size)
+        })
+    }
+
+    pub fn rasterize_text(&mut self, id: LayerId) -> Result<(), DocumentError> {
+        if self.layer(id)?.text.is_none() {
+            return Err(DocumentError::NotAText(id));
+        }
+        self.replace_planes(PlaneEdit {
+            texts: vec![(id, None)],
+            ..PlaneEdit::new(self.size)
+        })
+    }
+
+    pub fn select(
+        &mut self,
+        next: Option<Selection>,
+        mode: SelectionMode,
+    ) -> Result<(), DocumentError> {
+        let selection = match (&self.selection, next) {
+            (Some(current), Some(next)) => current.combined(&next, mode),
+            (Some(_), None) if matches!(mode, SelectionMode::Add | SelectionMode::Subtract) => {
+                return Ok(());
+            }
+            (_, next) => next,
+        };
+        self.set_selection(Some(selection.ok_or(DocumentError::EmptySelection)?))
+    }
+
+    pub fn deselect(&mut self) -> Result<(), DocumentError> {
+        self.set_selection(None)
+    }
+
+    pub fn invert_selection(&mut self) -> Result<(), DocumentError> {
+        self.change_selection(Selection::inverted)
+    }
+
+    pub fn feather_selection(&mut self, radius: u32) -> Result<(), DocumentError> {
+        self.resize_selection(radius, Selection::feathered)
+    }
+
+    pub fn grow_selection(&mut self, radius: u32) -> Result<(), DocumentError> {
+        self.resize_selection(radius, Selection::expanded)
+    }
+
+    pub fn shrink_selection(&mut self, radius: u32) -> Result<(), DocumentError> {
+        self.resize_selection(radius, Selection::contracted)
+    }
+
+    fn resize_selection(
+        &mut self,
+        radius: u32,
+        resize: fn(&Selection, u32, (u32, u32)) -> Option<Selection>,
+    ) -> Result<(), DocumentError> {
+        if !(1..=MAX_SELECTION_RADIUS).contains(&radius) {
+            return Err(DocumentError::InvalidSelection);
+        }
+        self.change_selection(|selection, size| resize(selection, radius, size))
+    }
+
+    fn change_selection(
+        &mut self,
+        change: impl FnOnce(&Selection, (u32, u32)) -> Option<Selection>,
+    ) -> Result<(), DocumentError> {
+        let current = self.selection.as_ref().ok_or(DocumentError::NoSelection)?;
+        let changed = change(current, self.size).ok_or(DocumentError::EmptySelection)?;
+        self.set_selection(Some(changed))
+    }
+
+    fn set_selection(&mut self, selection: Option<Selection>) -> Result<(), DocumentError> {
+        self.replace_planes(PlaneEdit {
+            selection: Some(selection.map(Arc::new)),
+            ..PlaneEdit::new(self.size)
+        })
     }
 
     pub fn add_group(
@@ -402,7 +548,10 @@ impl<T: Clone> Document<T> {
         size: (u32, u32),
         layers: Vec<RasterEdit<T>>,
     ) -> Result<(), DocumentError> {
-        self.replace_planes(size, layers, Vec::new())
+        self.replace_planes(PlaneEdit {
+            rasters: layers,
+            ..PlaneEdit::new(size)
+        })
     }
 
     pub fn replace_mask_tiles(
@@ -410,28 +559,52 @@ impl<T: Clone> Document<T> {
         id: LayerId,
         tiles: Vec<(TileCoord, Option<T>)>,
     ) -> Result<(), DocumentError> {
-        self.replace_planes(self.size, Vec::new(), vec![(id, tiles)])
+        self.replace_planes(PlaneEdit {
+            masks: vec![(id, tiles)],
+            ..PlaneEdit::new(self.size)
+        })
     }
 
-    pub fn replace_planes(
-        &mut self,
-        size: (u32, u32),
-        mut rasters: Vec<RasterEdit<T>>,
-        mut masks: Vec<RasterEdit<T>>,
-    ) -> Result<(), DocumentError> {
+    pub fn replace_planes(&mut self, mut edit: PlaneEdit<T>) -> Result<(), DocumentError> {
+        let size = edit.size;
         if size.0 == 0 || size.1 == 0 {
             return Err(DocumentError::InvalidSize);
         }
-        self.validate_plane_edits(size, &mut rasters, false)?;
-        self.validate_plane_edits(size, &mut masks, true)?;
-        if self.size != size || !rasters.is_empty() || !masks.is_empty() {
-            self.observed(|document| {
-                document.commit(Edit::Pixels {
-                    size,
-                    rasters,
-                    masks,
-                })
-            });
+        self.validate_plane_edits(size, &mut edit.rasters, false)?;
+        self.validate_plane_edits(size, &mut edit.masks, true)?;
+        for (id, text) in &edit.texts {
+            if self.layer(*id)?.text.is_none() {
+                return Err(DocumentError::NotAText(*id));
+            }
+            if text.as_ref().is_some_and(|text| !text.is_valid()) {
+                return Err(DocumentError::InvalidText);
+            }
+        }
+        let selection = edit.selection.take().unwrap_or_else(|| {
+            let clipped = |selection: &Arc<Selection>| selection.translated((0, 0), size);
+            match &self.selection {
+                Some(selection) if !selection.bounds().is_inside(size) => {
+                    clipped(selection).map(Arc::new)
+                }
+                unchanged => unchanged.clone(),
+            }
+        });
+        if selection
+            .as_ref()
+            .is_some_and(|selection| !selection.bounds().is_inside(size))
+        {
+            return Err(DocumentError::InvalidSelection);
+        }
+        edit.selection = (self.selection != selection).then_some(selection);
+        edit.texts
+            .retain(|(id, text)| self.layer_ref(*id).text != *text);
+        if self.size != size
+            || edit.selection.is_some()
+            || !edit.rasters.is_empty()
+            || !edit.masks.is_empty()
+            || !edit.texts.is_empty()
+        {
+            self.observed(|document| document.commit(Edit::Pixels(edit)));
         }
         Ok(())
     }
@@ -651,14 +824,28 @@ impl<T: Clone> Document<T> {
                     properties: previous,
                 }
             }
-            Edit::Pixels {
+            Edit::Pixels(PlaneEdit {
                 size,
                 rasters,
                 masks,
-            } => {
+                texts,
+                selection,
+            }) => {
                 let old_size = mem::replace(&mut self.size, size);
                 let rasters = self.swap_plane(rasters, false);
                 let masks = self.swap_plane(masks, true);
+                let texts = texts
+                    .into_iter()
+                    .map(|(id, text)| {
+                        let previous = mem::replace(&mut self.layer_mut(id).text, text);
+                        self.events.push(Event::LayerChanged { id });
+                        (id, previous)
+                    })
+                    .collect();
+                let selection = selection.map(|selection| {
+                    self.events.push(Event::SelectionChanged);
+                    mem::replace(&mut self.selection, selection)
+                });
                 if old_size != size {
                     self.dirty = TileCoord::all(size).collect();
                     self.events.push(Event::CanvasResized {
@@ -666,11 +853,13 @@ impl<T: Clone> Document<T> {
                         height: size.1,
                     });
                 }
-                Edit::Pixels {
+                Edit::Pixels(PlaneEdit {
                     size: old_size,
                     rasters,
                     masks,
-                }
+                    texts,
+                    selection,
+                })
             }
             Edit::Mask { id, mask } => {
                 let layer = self.layer_mut(id);
@@ -864,6 +1053,11 @@ fn check_layer<T>(layer: &Layer<T>, size: (u32, u32)) -> Result<(), DocumentErro
         .is_some_and(|adjustment| !adjustment.is_valid())
     {
         return Err(DocumentError::InvalidAdjustment);
+    }
+    if let Some(text) = &layer.text
+        && (layer.tiles().is_none() || !text.is_valid())
+    {
+        return Err(DocumentError::InvalidText);
     }
     let outside = layer
         .tiles()

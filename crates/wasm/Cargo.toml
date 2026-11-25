@@ -15,7 +15,14 @@ wgpu = { workspace = true, features = ["webgpu"] }
 wasm-bindgen.workspace = true
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["HtmlCanvasElement", "console"] }
+web-sys = { version = "0.3", features = [
+    "HtmlCanvasElement",
+    "ImageData",
+    "OffscreenCanvas",
+    "OffscreenCanvasRenderingContext2d",
+    "TextMetrics",
+    "console",
+] }
 console_error_panic_hook = "0.1"
 futures-channel.workspace = true
 serde.workspace = true

@@ -7,7 +7,7 @@ use std::{
 };
 
 use futures_channel::mpsc::UnboundedSender;
-use nijimi_core::Event;
+use nijimi_core::{Event, TileCoord};
 use wgpu::ShaderStages;
 
 use crate::{
@@ -25,6 +25,7 @@ pub(crate) struct Layouts {
     pub resample: wgpu::BindGroupLayout,
     pub export: wgpu::BindGroupLayout,
     pub stroke: wgpu::BindGroupLayout,
+    pub heal: wgpu::BindGroupLayout,
     pub apply_mask: wgpu::BindGroupLayout,
     pub grade: wgpu::BindGroupLayout,
     pub copy_tile: wgpu::BindGroupLayout,
@@ -42,6 +43,16 @@ pub(crate) struct Pipelines {
     pub dab: wgpu::RenderPipeline,
     pub stroke: wgpu::RenderPipeline,
     pub mask_stroke: wgpu::RenderPipeline,
+    pub clone_stroke: wgpu::RenderPipeline,
+    pub replace_stroke: wgpu::RenderPipeline,
+    pub smudge: wgpu::RenderPipeline,
+    pub lift: wgpu::RenderPipeline,
+    pub drop: wgpu::RenderPipeline,
+    pub heal_base: wgpu::RenderPipeline,
+    pub heal_pull: wgpu::RenderPipeline,
+    pub heal_push: wgpu::RenderPipeline,
+    pub heal_relax: wgpu::RenderPipeline,
+    pub heal: wgpu::RenderPipeline,
     pub apply_mask: wgpu::RenderPipeline,
     pub grade: wgpu::RenderPipeline,
     pub copy_tile: wgpu::RenderPipeline,
@@ -231,6 +242,24 @@ pub(crate) fn draw_fullscreen(
     pass.draw(0..3, 0..1);
 }
 
+pub(crate) fn draw_tile(
+    encoder: &mut wgpu::CommandEncoder,
+    target: &wgpu::TextureView,
+    pipeline: &wgpu::RenderPipeline,
+    bindings: &wgpu::BindGroup,
+    coord: TileCoord,
+) {
+    let mut pass = begin_pass(encoder, target, CLEAR);
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bindings, &[]);
+    pass.draw(0..3, tile_instance(coord));
+}
+
+pub(crate) fn tile_instance(coord: TileCoord) -> std::ops::Range<u32> {
+    let packed = coord.y << 16 | coord.x;
+    packed..packed + 1
+}
+
 pub(crate) fn texture_descriptor(
     label: &str,
     (width, height): (u32, u32),
@@ -299,10 +328,17 @@ fn create_layouts(device: &wgpu::Device) -> Layouts {
         image: layout("image", &[texture, uniform(false)]),
         resample: layout("resample", &[texture, uniform(false)]),
         export: layout("export", &[texture, uniform(false)]),
-        stroke: layout("stroke", &[texture, texture, uniform(false)]),
+        stroke: layout(
+            "stroke",
+            &[texture, texture, uniform(false), texture, texture],
+        ),
+        heal: layout(
+            "heal",
+            &[texture, texture, texture, sampler, uniform(false)],
+        ),
         composite: layout("composite", &composite),
         mipmap: layout("mipmap", &[texture, sampler]),
-        present: layout("present", &[texture, sampler, uniform(false)]),
+        present: layout("present", &[texture, sampler, uniform(false), texture]),
     }
 }
 
@@ -321,6 +357,15 @@ fn create_pipelines(
         blend: None,
         topology: wgpu::PrimitiveTopology::TriangleList,
     };
+    let over_tile = |fragment, layout| PipelineSpec {
+        vertex: "tile_vertex",
+        ..fullscreen(fragment, TILE_FORMAT, layout)
+    };
+    let dabs = [Some(wgpu::VertexBufferLayout {
+        array_stride: size_of::<DabInstance>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &DabInstance::ATTRIBUTES,
+    })];
     let build = |spec: PipelineSpec<'_>| spec.build(device, shader);
     let accumulate = wgpu::BlendComponent {
         src_factor: wgpu::BlendFactor::One,
@@ -328,43 +373,51 @@ fn create_pipelines(
         operation: wgpu::BlendOperation::Add,
     };
     Pipelines {
-        import: build(PipelineSpec {
-            vertex: "import_vertex",
-            ..fullscreen("import_fragment", TILE_FORMAT, &layouts.image)
-        }),
-        import_mask: build(PipelineSpec {
-            vertex: "import_vertex",
-            ..fullscreen("import_mask_fragment", TILE_FORMAT, &layouts.image)
-        }),
+        import: build(over_tile("import_fragment", &layouts.image)),
+        import_mask: build(over_tile("import_mask_fragment", &layouts.image)),
         export: build(fullscreen("export_fragment", IMAGE_FORMAT, &layouts.export)),
         resample: build(fullscreen(
             "resample_fragment",
             TILE_FORMAT,
             &layouts.resample,
         )),
-        erase: build(fullscreen("erase_fragment", TILE_FORMAT, &layouts.stroke)),
+        erase: build(over_tile("erase_fragment", &layouts.stroke)),
         dab: build(PipelineSpec {
             vertex: "dab_vertex",
             fragment: "dab_fragment",
             target: COVERAGE_FORMAT,
             layout: None,
-            buffers: &[Some(wgpu::VertexBufferLayout {
-                array_stride: size_of::<DabInstance>() as u64,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &DabInstance::ATTRIBUTES,
-            })],
+            buffers: &dabs,
             blend: Some(wgpu::BlendState {
                 color: accumulate,
                 alpha: accumulate,
             }),
             topology: wgpu::PrimitiveTopology::TriangleStrip,
         }),
-        stroke: build(fullscreen("stroke_fragment", TILE_FORMAT, &layouts.stroke)),
-        mask_stroke: build(fullscreen(
-            "mask_stroke_fragment",
+        stroke: build(over_tile("stroke_fragment", &layouts.stroke)),
+        mask_stroke: build(over_tile("mask_stroke_fragment", &layouts.stroke)),
+        clone_stroke: build(over_tile("clone_stroke_fragment", &layouts.stroke)),
+        replace_stroke: build(over_tile("replace_stroke_fragment", &layouts.stroke)),
+        smudge: build(PipelineSpec {
+            vertex: "smudge_vertex",
+            fragment: "smudge_fragment",
+            target: TILE_FORMAT,
+            layout: Some(&layouts.stroke),
+            buffers: &dabs,
+            blend: None,
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+        }),
+        lift: build(over_tile("lift_fragment", &layouts.stroke)),
+        drop: build(over_tile("drop_fragment", &layouts.stroke)),
+        heal_base: build(fullscreen("heal_base_fragment", TILE_FORMAT, &layouts.heal)),
+        heal_pull: build(fullscreen("heal_pull_fragment", TILE_FORMAT, &layouts.heal)),
+        heal_push: build(fullscreen("heal_push_fragment", TILE_FORMAT, &layouts.heal)),
+        heal_relax: build(fullscreen(
+            "heal_relax_fragment",
             TILE_FORMAT,
-            &layouts.stroke,
+            &layouts.heal,
         )),
+        heal: build(fullscreen("heal_fragment", TILE_FORMAT, &layouts.heal)),
         apply_mask: build(fullscreen(
             "apply_mask_fragment",
             TILE_FORMAT,

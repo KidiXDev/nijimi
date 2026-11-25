@@ -56,7 +56,6 @@ impl ProjectSnapshot {
 
 pub struct ProjectLoader {
     pub(crate) gpu: Rc<Gpu>,
-    pub(crate) view_buffer: wgpu::Buffer,
     pub(crate) file: Vec<u8>,
 }
 
@@ -67,17 +66,11 @@ pub struct LoadedProject {
 
 impl ProjectLoader {
     pub async fn load(self) -> Result<LoadedProject, EngineError> {
-        let Self {
-            gpu,
-            view_buffer,
-            file,
-        } = self;
+        let Self { gpu, file } = self;
         let mut reader = ProjectReader::open(file)?;
         let size = reader.document().size();
         gpu.check_size(size)?;
-        let composite = gpu
-            .catch_errors(|| Composite::new(&gpu, size, &view_buffer))
-            .await?;
+        let composite = gpu.catch_errors(|| Composite::new(&gpu, size)).await?;
 
         let mut uploaded = BTreeMap::new();
         for batch in tile_list(reader.document().layers()).chunks(TILES_PER_LOAD_BATCH) {

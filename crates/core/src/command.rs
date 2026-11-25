@@ -1,7 +1,8 @@
 use serde::{Deserialize, Deserializer};
 
 use crate::{
-    Adjustment, BlendMode, Brush, BrushDynamics, LayerId, PixelRect, StrokePoint, Transform,
+    Adjustment, BlendMode, Brush, BrushDynamics, LayerId, PixelRect, RetouchTool, SelectionMode,
+    SelectionShape, StrokePoint, Transform,
 };
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -90,6 +91,36 @@ pub enum Command {
         points: Vec<StrokePoint>,
         #[serde(default)]
         dynamics: BrushDynamics,
+    },
+    RetouchStroke {
+        layer: LayerId,
+        tool: RetouchTool,
+        brush: Brush,
+        points: Vec<StrokePoint>,
+        #[serde(default)]
+        dynamics: BrushDynamics,
+    },
+    Select {
+        shape: SelectionShape,
+        #[serde(default)]
+        mode: SelectionMode,
+    },
+    Deselect,
+    InvertSelection,
+    FeatherSelection {
+        radius: u32,
+    },
+    GrowSelection {
+        radius: u32,
+    },
+    ShrinkSelection {
+        radius: u32,
+    },
+    MaskFromSelection {
+        id: LayerId,
+    },
+    RasterizeText {
+        id: LayerId,
     },
     Crop {
         rect: PixelRect,

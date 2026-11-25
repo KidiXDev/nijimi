@@ -31,6 +31,33 @@ impl PixelRect {
             && self.height <= size.1.saturating_sub(self.y)
     }
 
+    pub fn overlaps(self, other: Self) -> bool {
+        self.x < other.x + other.width
+            && other.x < self.x + self.width
+            && self.y < other.y + other.height
+            && other.y < self.y + self.height
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        let (x, y) = (self.x.min(other.x), self.y.min(other.y));
+        Self {
+            x,
+            y,
+            width: (self.x + self.width).max(other.x + other.width) - x,
+            height: (self.y + self.height).max(other.y + other.height) - y,
+        }
+    }
+
+    pub fn grown(self, margin: u32, (width, height): (u32, u32)) -> Self {
+        let (x, y) = (self.x.saturating_sub(margin), self.y.saturating_sub(margin));
+        Self {
+            x,
+            y,
+            width: (self.x + self.width + margin).min(width) - x,
+            height: (self.y + self.height + margin).min(height) - y,
+        }
+    }
+
     pub fn with_ratio(self, ratio: CropRatio) -> Option<Self> {
         let (width, height) = match ratio {
             CropRatio::Square => (1, 1),

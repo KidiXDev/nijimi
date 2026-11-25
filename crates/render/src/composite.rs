@@ -68,13 +68,13 @@ struct Mipmap {
 pub(crate) struct Composite {
     texture: wgpu::Texture,
     mipmaps: Vec<Mipmap>,
-    present_bindings: wgpu::BindGroup,
+    full_view: wgpu::TextureView,
     scratch: Vec<TileRef>,
     was_graded: bool,
 }
 
 impl Composite {
-    pub fn new(gpu: &Gpu, size: (u32, u32), view_buffer: &wgpu::Buffer) -> Self {
+    pub fn new(gpu: &Gpu, size: (u32, u32)) -> Self {
         let level_count = size.0.max(size.1).ilog2() + 1;
         let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
             mip_level_count: level_count,
@@ -104,25 +104,17 @@ impl Composite {
                 }
             })
             .collect();
-        let present_bindings = gpu.bind(
-            &gpu.layouts.present,
-            &[
-                TextureView(&full_view),
-                Sampler(&gpu.sampler),
-                view_buffer.as_entire_binding(),
-            ],
-        );
         Self {
             texture,
             mipmaps,
-            present_bindings,
+            full_view,
             scratch: Vec::new(),
             was_graded: false,
         }
     }
 
-    pub fn present_bindings(&self) -> &wgpu::BindGroup {
-        &self.present_bindings
+    pub fn full_view(&self) -> &wgpu::TextureView {
+        &self.full_view
     }
 
     pub fn size(&self) -> (u32, u32) {

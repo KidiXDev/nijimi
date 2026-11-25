@@ -7,13 +7,16 @@ mod gpu;
 mod grade;
 mod project;
 mod readback;
+mod retouch;
+mod selection;
 mod stroke;
 mod tile;
 
-pub use engine::Engine;
+pub use engine::{Engine, TextImage};
 pub use error::EngineError;
 pub use fill::{Fill, Filled};
 pub use project::{LoadedProject, ProjectLoader, ProjectSnapshot};
 pub use readback::Readback;
+pub use selection::{Selected, SelectionJob};
 pub use tile::{Tile, TileRef};
 pub use wgpu;

@@ -18,7 +18,7 @@ pub enum EngineError {
     InvalidTransform,
     UnsupportedPreview,
     InvalidFill,
-    StaleFill,
+    StaleResult,
     Document(DocumentError),
     Project(ProjectError),
     OutOfGpuMemory,
@@ -47,10 +47,10 @@ impl fmt::Display for EngineError {
             Self::InvalidRegion => write!(formatter, "The region must lie inside the canvas."),
             Self::InvalidTransform => write!(formatter, "A transform value is out of range."),
             Self::UnsupportedPreview => write!(formatter, "This command cannot be previewed."),
-            Self::InvalidFill => write!(formatter, "Fill color or tolerance is out of range."),
-            Self::StaleFill => write!(
+            Self::InvalidFill => write!(formatter, "A fill or wand value is out of range."),
+            Self::StaleResult => write!(
                 formatter,
-                "The document changed while the fill was running."
+                "The document changed while the edit was running."
             ),
             Self::InvalidStroke => write!(formatter, "A stroke point is out of range."),
             Self::Document(error) => error.fmt(formatter),

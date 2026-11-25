@@ -1,7 +1,7 @@
 use js_sys::JSON;
 use nijimi_core::{
     Adjustment, Document, Layer, LayerContent, LayerId, LayerPlace, LayerProperties, LutInfo,
-    deserialize_present,
+    PixelRect, SelectionMode, TextSettings, deserialize_present,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use wasm_bindgen::prelude::*;
@@ -74,6 +74,45 @@ export interface FillOptions extends Point {
   tolerance?: number;
 }
 
+export type SelectionShape =
+  | { type: 'rectangle'; x: number; y: number; width: number; height: number }
+  | { type: 'ellipse'; x: number; y: number; width: number; height: number }
+  | { type: 'lasso'; points: Point[] };
+
+/** Every mode acts like `replace` while nothing is selected. */
+export type SelectionMode = 'replace' | 'add' | 'subtract' | 'intersect';
+
+export interface SelectSimilarOptions extends Point {
+  /** Compares this layer alone. Omit it to compare the visible composite. */
+  layer?: number;
+  tolerance?: number;
+  /** Defaults to true, which keeps only pixels connected to the starting point. */
+  contiguous?: boolean;
+  mode?: SelectionMode;
+}
+
+/** The offset points from the painted pixel to the pixel it copies. */
+export type RetouchTool =
+  | { type: 'clone'; offsetX: number; offsetY: number }
+  | { type: 'heal'; offsetX: number; offsetY: number }
+  | { type: 'smudge' }
+  | { type: 'blur'; radius: number };
+
+export interface TextSettings extends Point {
+  text: string;
+  /** A CSS font family list. Load the font before using it. */
+  fontFamily: string;
+  fontSize: number;
+  weight?: number;
+  italic?: boolean;
+  color?: Rgb;
+  align?: 'left' | 'center' | 'right';
+  /** Multiple of the font size. */
+  lineHeight?: number;
+  /** The a, b, c and d values of a canvas transform, applied around the position. */
+  transform?: [number, number, number, number];
+}
+
 export type Rgb = [number, number, number];
 
 export type AdjustmentSettings =
@@ -144,6 +183,15 @@ export type Command =
   | { type: 'selectLayer'; id: number }
   | { type: 'paintStroke'; layer: number; brush: Brush; dynamics?: BrushDynamics; points: StrokePoint[] }
   | { type: 'eraseStroke'; layer: number; brush: Brush; dynamics?: BrushDynamics; points: StrokePoint[] }
+  | { type: 'retouchStroke'; layer: number; tool: RetouchTool; brush: Brush; dynamics?: BrushDynamics; points: StrokePoint[] }
+  | { type: 'select'; shape: SelectionShape; mode?: SelectionMode }
+  | { type: 'deselect' }
+  | { type: 'invertSelection' }
+  | { type: 'featherSelection'; radius: number }
+  | { type: 'growSelection'; radius: number }
+  | { type: 'shrinkSelection'; radius: number }
+  | { type: 'maskFromSelection'; id: number }
+  | { type: 'rasterizeText'; id: number }
   | { type: 'undo' }
   | { type: 'redo' };
 
@@ -157,6 +205,7 @@ export type EditorEvent =
   | { type: 'layerChanged'; id: number }
   | { type: 'pixelsChanged'; id: number }
   | { type: 'maskChanged'; id: number }
+  | { type: 'selectionChanged' }
   | { type: 'activeLayerChanged'; id: number | null }
   | { type: 'historyChanged'; canUndo: boolean; canRedo: boolean }
   | { type: 'deviceLost'; message: string }
@@ -168,8 +217,9 @@ export interface LayerState {
   visible: boolean;
   opacity: number;
   blendMode: BlendMode;
-  kind: 'raster' | 'group' | 'adjustment';
+  kind: 'raster' | 'text' | 'group' | 'adjustment';
   adjustment: AdjustmentSettings | { type: 'lut'; table: LutInfo } | null;
+  text: Required<TextSettings> | null;
   mask: { reveal: boolean } | null;
   children: LayerState[];
 }
@@ -178,6 +228,8 @@ export interface EditorState {
   width: number;
   height: number;
   activeLayer: number | null;
+  /** Bounds of the selected pixels, or null when nothing is selected. */
+  selection: PixelRect | null;
   canUndo: boolean;
   canRedo: boolean;
   layers: LayerState[];
@@ -211,12 +263,30 @@ pub(crate) struct FillOptions {
     pub tolerance: f32,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct SelectSimilarOptions {
+    pub x: u32,
+    pub y: u32,
+    pub layer: Option<LayerId>,
+    #[serde(default)]
+    pub tolerance: f32,
+    #[serde(default = "contiguous")]
+    pub contiguous: bool,
+    #[serde(default)]
+    pub mode: SelectionMode,
+}
+
+fn contiguous() -> bool {
+    true
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EditorState<'a> {
     width: u32,
     height: u32,
     active_layer: Option<LayerId>,
+    selection: Option<PixelRect>,
     can_undo: bool,
     can_redo: bool,
     layers: Vec<LayerState<'a>>,
@@ -229,6 +299,7 @@ struct LayerState<'a> {
     properties: &'a LayerProperties,
     kind: &'static str,
     adjustment: Option<AdjustmentState<'a>>,
+    text: Option<&'a TextSettings>,
     mask: Option<MaskState>,
     children: Vec<LayerState<'a>>,
 }
@@ -256,6 +327,7 @@ impl<'a> EditorState<'a> {
             width,
             height,
             active_layer: document.active(),
+            selection: document.selection().map(|selection| selection.bounds()),
             can_undo: committed.can_undo(),
             can_redo: committed.can_redo(),
             layers: layer_states(document.layers()),
@@ -270,6 +342,7 @@ fn layer_states<T>(layers: &[Layer<T>]) -> Vec<LayerState<'_>> {
             id: layer.id,
             properties: &layer.properties,
             kind: match layer.content {
+                LayerContent::Raster(_) if layer.text.is_some() => "text",
                 LayerContent::Raster(_) => "raster",
                 LayerContent::Group(_) => "group",
                 LayerContent::Adjustment(_) => "adjustment",
@@ -281,6 +354,7 @@ fn layer_states<T>(layers: &[Layer<T>]) -> Vec<LayerState<'_>> {
                 },
                 _ => AdjustmentState::Settings(adjustment),
             }),
+            text: layer.text.as_ref(),
             mask: layer.mask.as_ref().map(|mask| MaskState {
                 reveal: mask.reveal,
             }),

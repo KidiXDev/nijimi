@@ -10,13 +10,13 @@ use zip::{ZipArchive, ZipWriter, result::ZipError, write::SimpleFileOptions};
 
 use crate::{
     Adjustment, CubeLut, Document, DocumentError, Layer, LayerContent, LayerId, LayerMask,
-    LayerProperties, LutInfo, MAX_LAYERS, TILE_BYTES, TileCoord, Tiles,
+    LayerProperties, LutInfo, MAX_LAYERS, TILE_BYTES, TextSettings, TileCoord, Tiles,
 };
 
 pub const MAX_PROJECT_TILES: usize = 32_768;
 
 const FORMAT: &str = "nijimi";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const MAX_LUT_BYTES: usize = 128 * 1024 * 1024;
 type Archive = ZipArchive<Cursor<Vec<u8>>>;
 const MANIFEST: &str = "manifest.json";
@@ -115,6 +115,8 @@ struct ManifestLayer {
     properties: LayerProperties,
     #[serde(flatten)]
     content: ManifestContent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<TextSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mask: Option<ManifestMask>,
 }
@@ -250,6 +252,7 @@ impl ProjectWriter {
         Ok(ManifestLayer {
             id: layer.id,
             properties: layer.properties.clone(),
+            text: layer.text.clone(),
             mask: layer.mask.as_ref().map(|mask| ManifestMask {
                 reveal: mask.reveal,
                 tiles: mask.tiles.keys().copied().collect(),
@@ -401,6 +404,7 @@ impl Limits {
             id,
             properties: layer.properties,
             content,
+            text: layer.text,
             mask,
         })
     }
@@ -600,6 +604,47 @@ mod tests {
             reader.read_tile(2, TileCoord::new(1, 0)).expect("tile"),
             tile(0x3555)
         );
+    }
+
+    #[test]
+    fn version_2_files_stay_readable() {
+        let json = r#"{
+            "format": "nijimi", "version": 2, "width": 300, "height": 200, "activeLayer": 5,
+            "layers": [{
+                "id": 5, "name": "Grade", "visible": true, "opacity": 1.0, "blendMode": "normal",
+                "kind": "adjustment", "adjustment": {"type": "exposure", "stops": 0.5},
+                "mask": {"reveal": true, "tiles": [[0, 0]]}
+            }]
+        }"#;
+        let file = archive(&[(MANIFEST, json.as_bytes()), ("masks/5/0_0", &tile(0x3800))]);
+        let mut reader = ProjectReader::open(file).expect("open");
+        let layer = &reader.document().layers()[0];
+        assert_eq!(layer.grade(), Some(&Adjustment::Exposure { stops: 0.5 }));
+        assert_eq!(layer.text, None);
+        assert!(layer.mask.as_ref().is_some_and(|mask| mask.reveal));
+        let coord = TileCoord::new(0, 0);
+        assert_eq!(reader.read_mask_tile(5, coord).expect("tile"), tile(0x3800));
+    }
+
+    #[test]
+    fn invalid_text_is_rejected() {
+        let text = r#""text":{"text":"Hi","x":1,"y":2,"fontFamily":"Inter","fontSize":24}"#;
+        let layer =
+            |text: &str| raster(1, "[]").replace("\"tiles\":[]", &format!("\"tiles\":[],{text}"));
+        let reader = open_manifest(&manifest(3, SIZE, &layer(text))).expect("open");
+        let settings = reader.document().layers()[0].text.as_ref().expect("text");
+        assert_eq!((settings.position.y, settings.weight), (2.0, 400));
+        let group = layer(text).replace("\"raster\",\"tiles\":[]", "\"group\",\"layers\":[]");
+        let broken = [
+            text.replace("24", "0"),
+            text.replace("24", "1e999"),
+            text.replace("\"x\":1", "\"x\":1e9"),
+            text.replace("Inter", ""),
+            text.replace("Hi", &"a".repeat(10_001)),
+        ];
+        for layer in broken.iter().map(|text| layer(text)).chain([group]) {
+            assert!(open_manifest(&manifest(3, SIZE, &layer)).is_err());
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Adjustment, TileCoord};
+use crate::{Adjustment, TextSettings, TileCoord};
 
 pub type LayerId = u32;
 pub type Tiles<T> = BTreeMap<TileCoord, T>;
@@ -65,6 +65,7 @@ pub struct Layer<T> {
     pub id: LayerId,
     pub properties: LayerProperties,
     pub content: LayerContent<T>,
+    pub text: Option<TextSettings>,
     pub mask: Option<LayerMask<T>>,
 }
 
@@ -87,6 +88,7 @@ impl<T> Layer<T> {
             id,
             properties: LayerProperties::named(name),
             content: LayerContent::Raster(Tiles::new()),
+            text: None,
             mask: None,
         }
     }
@@ -96,6 +98,7 @@ impl<T> Layer<T> {
             id,
             properties: LayerProperties::named(name),
             content: LayerContent::Group(Vec::new()),
+            text: None,
             mask: None,
         }
     }
@@ -105,6 +108,7 @@ impl<T> Layer<T> {
             id,
             properties: LayerProperties::named(name),
             content: LayerContent::Adjustment(adjustment),
+            text: None,
             mask: None,
         }
     }
@@ -171,6 +175,7 @@ impl<T> Layer<T> {
         Layer {
             id: self.id,
             properties: self.properties.clone(),
+            text: self.text.clone(),
             mask: self.mask.as_ref().map(|mask| LayerMask {
                 reveal: mask.reveal,
                 tiles: plane(&mask.tiles, true),

@@ -5,6 +5,8 @@ use crate::{Point, TILE_SIZE, TileCoord};
 pub const MAX_BRUSH_DIAMETER: f32 = 4096.0;
 pub const MAX_COORDINATE: f32 = 1e6;
 
+pub const MAX_BLUR_RADIUS: u32 = 32;
+
 const SPACING_RATIO: f32 = 0.1;
 const MIN_SPACING: f32 = 0.5;
 const MIN_DIAMETER: f32 = 1.0;
@@ -71,6 +73,33 @@ impl PressureCurve {
             Self::Soft => value.sqrt(),
             Self::Firm => value * value,
             Self::Fixed => 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum RetouchTool {
+    Clone { offset_x: i32, offset_y: i32 },
+    Heal { offset_x: i32, offset_y: i32 },
+    Smudge,
+    Blur { radius: u32 },
+}
+
+impl RetouchTool {
+    pub fn is_valid(self) -> bool {
+        match self {
+            Self::Clone { offset_x, offset_y } | Self::Heal { offset_x, offset_y } => {
+                [offset_x, offset_y]
+                    .iter()
+                    .all(|offset| offset.unsigned_abs() <= MAX_COORDINATE as u32)
+            }
+            Self::Smudge => true,
+            Self::Blur { radius } => (1..=MAX_BLUR_RADIUS).contains(&radius),
         }
     }
 }

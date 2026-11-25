@@ -18,6 +18,7 @@ pub enum Event {
     LayerChanged { id: LayerId },
     PixelsChanged { id: LayerId },
     MaskChanged { id: LayerId },
+    SelectionChanged,
     ActiveLayerChanged { id: Option<LayerId> },
     HistoryChanged { can_undo: bool, can_redo: bool },
     DeviceLost { message: String },

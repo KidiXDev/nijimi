@@ -6,16 +6,19 @@ use std::{
 use futures_channel::mpsc::UnboundedReceiver;
 use js_sys::{Function, Promise, Uint8Array};
 use nijimi_core::{
-    Brush, BrushDynamics, BrushPreset, CropRatio, Event, LayerId, PixelRect, Point, StrokePoint,
-    Viewport,
+    Brush, BrushDynamics, BrushPreset, CropRatio, DocumentError, Event, LayerId, PixelRect, Point,
+    RetouchTool, SelectionMode, StrokePoint, TextSettings, Viewport,
 };
-use nijimi_render::{Engine, EngineError, Readback};
+use nijimi_render::{Engine, EngineError, Readback, SelectionJob};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{future_to_promise, spawn_local};
 use web_sys::{HtmlCanvasElement, console};
 use wgpu::CurrentSurfaceTexture;
 
-use crate::bridge::{EditorState, FillOptions, ImportOptions, from_js, to_js};
+use crate::{
+    bridge::{EditorState, FillOptions, ImportOptions, SelectSimilarOptions, from_js, to_js},
+    text::RenderedText,
+};
 
 type Listeners = Rc<RefCell<Vec<(u32, Function)>>>;
 
@@ -424,6 +427,106 @@ impl Editor {
         })
     }
 
+    #[wasm_bindgen(js_name = selectSimilar, unchecked_return_type = "Promise<void>")]
+    pub fn select_similar(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "SelectSimilarOptions")] options: JsValue,
+    ) -> Promise {
+        let job = from_js::<SelectSimilarOptions>(&options).and_then(|options| {
+            self.session
+                .borrow_mut()
+                .engine
+                .select_similar(
+                    options.layer,
+                    (options.x, options.y),
+                    options.tolerance,
+                    options.contiguous,
+                    options.mode,
+                )
+                .map_err(|error| JsError::from(error).into())
+        });
+        self.commit_selection(job)
+    }
+
+    #[wasm_bindgen(js_name = selectMask, unchecked_return_type = "Promise<void>")]
+    pub fn select_mask(
+        &mut self,
+        id: LayerId,
+        #[wasm_bindgen(unchecked_optional_param_type = "SelectionMode")] mode: Option<JsValue>,
+    ) -> Promise {
+        let mode: Result<Option<SelectionMode>, _> = mode.as_ref().map(from_js).transpose();
+        let job = mode.and_then(|mode| {
+            self.session
+                .borrow_mut()
+                .engine
+                .select_mask(id, mode.unwrap_or_default())
+                .map_err(|error| JsError::from(error).into())
+        });
+        self.commit_selection(job)
+    }
+
+    fn commit_selection(&self, job: Result<SelectionJob, JsValue>) -> Promise {
+        let session = Rc::downgrade(&self.session);
+        future_to_promise(async move {
+            let selected = job?.prepare().await.map_err(JsError::from)?;
+            let session = session
+                .upgrade()
+                .ok_or_else(|| JsError::new("The editor was closed."))?;
+            session
+                .borrow_mut()
+                .engine
+                .commit_selection(selected)
+                .map_err(JsError::from)?;
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+
+    #[wasm_bindgen(js_name = addText)]
+    pub fn add_text(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "TextSettings")] text: JsValue,
+        #[wasm_bindgen(unchecked_optional_param_type = "LayerPlacement")] options: Option<JsValue>,
+    ) -> Result<LayerId, JsValue> {
+        let options: ImportOptions = options
+            .as_ref()
+            .map(from_js)
+            .transpose()?
+            .unwrap_or_default();
+        let place = options.place();
+        let (text, rendered) = self.render_text(&text)?;
+        Ok(self
+            .session
+            .borrow_mut()
+            .engine
+            .add_text(text, rendered.image(), options.name, place)
+            .map_err(JsError::from)?)
+    }
+
+    #[wasm_bindgen(js_name = setText)]
+    pub fn set_text(
+        &mut self,
+        id: LayerId,
+        #[wasm_bindgen(unchecked_param_type = "TextSettings")] text: JsValue,
+    ) -> Result<(), JsValue> {
+        let (text, rendered) = self.render_text(&text)?;
+        Ok(self
+            .session
+            .borrow_mut()
+            .engine
+            .set_text(id, text, rendered.image())
+            .map_err(JsError::from)?)
+    }
+
+    fn render_text(&self, text: &JsValue) -> Result<(TextSettings, RenderedText), JsValue> {
+        let text: TextSettings = from_js(text)?;
+        if !text.is_valid() {
+            return Err(JsError::from(DocumentError::InvalidText).into());
+        }
+        let size = self.session.borrow().engine.committed_document().size();
+        let rendered = RenderedText::new(&text, size)?;
+        Ok((text, rendered))
+    }
+
     #[wasm_bindgen(js_name = documentPoint, unchecked_return_type = "Point")]
     pub fn document_point(&self, x: f32, y: f32) -> Result<JsValue, JsValue> {
         to_js(&self.session.borrow().viewport.to_document(Point::new(x, y)))
@@ -517,6 +620,24 @@ impl Editor {
         Ok(session
             .engine
             .begin_mask_stroke(id, brush, dynamics, value, point)?)
+    }
+
+    #[wasm_bindgen(js_name = beginRetouchStroke)]
+    pub fn begin_retouch_stroke(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "RetouchTool")] tool: JsValue,
+        x: f32,
+        y: f32,
+        pressure: f32,
+    ) -> Result<(), JsValue> {
+        let tool: RetouchTool = from_js(&tool)?;
+        let mut session = self.session.borrow_mut();
+        let (brush, dynamics) = (session.brush, session.dynamics);
+        let point = session.stroke_point(x, y, pressure);
+        Ok(session
+            .engine
+            .begin_retouch_stroke(tool, brush, dynamics, point)
+            .map_err(JsError::from)?)
     }
 
     #[wasm_bindgen(js_name = extendStroke)]

@@ -19,7 +19,7 @@ struct TileVertex {
 }
 
 @vertex
-fn import_vertex(
+fn tile_vertex(
     @builtin(vertex_index) index: u32,
     @builtin(instance_index) packed_coord: u32,
 ) -> TileVertex {
@@ -82,6 +82,15 @@ struct DabVertex {
     @location(2) @interpolate(flat) flow: f32,
 }
 
+fn dab_corner(index: u32) -> vec2f {
+    return vec2f(f32(index & 1u), f32(index >> 1u)) * 2.0 - 1.0;
+}
+
+fn dab_position(center: vec2f, offset: vec2f, radius: f32) -> vec4f {
+    let pixel = (center + offset * radius) / f32(TILE_SIZE);
+    return vec4f(pixel.x * 2.0 - 1.0, 1.0 - pixel.y * 2.0, 0.0, 1.0);
+}
+
 @vertex
 fn dab_vertex(
     @builtin(vertex_index) index: u32,
@@ -90,46 +99,213 @@ fn dab_vertex(
     @location(2) inner: f32,
     @location(3) flow: f32,
 ) -> DabVertex {
-    let offset = vec2f(f32(index & 1u), f32(index >> 1u)) * 2.0 - 1.0;
-    let pixel = (center + offset * radius) / f32(TILE_SIZE);
-    let position = vec2f(pixel.x * 2.0 - 1.0, 1.0 - pixel.y * 2.0);
-    return DabVertex(vec4f(position, 0.0, 1.0), offset, inner, flow);
+    let offset = dab_corner(index);
+    return DabVertex(dab_position(center, offset, radius), offset, inner, flow);
+}
+
+fn dab_coverage(offset: vec2f, inner: f32, flow: f32) -> f32 {
+    return flow * (1.0 - smoothstep(inner, 1.0, length(offset)));
 }
 
 @fragment
 fn dab_fragment(in: DabVertex) -> @location(0) vec4f {
-    return vec4f(in.flow * (1.0 - smoothstep(in.inner, 1.0, length(in.offset))));
+    return vec4f(dab_coverage(in.offset, in.inner, in.flow));
 }
 
 // Stroke
 struct Paint {
     color: vec3f,
     opacity: f32,
+    selection: vec2i,
+    canvas: vec2i,
+    unselected: f32,
 }
 
 @group(0) @binding(1) var coverage: texture_2d<f32>;
 @group(0) @binding(2) var<uniform> paint: Paint;
+@group(0) @binding(3) var selection: texture_2d<f32>;
+@group(0) @binding(4) var replacement: texture_2d<f32>;
 
-@fragment
-fn stroke_fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
-    let pixel = vec2i(position.xy);
-    let alpha = textureLoad(coverage, pixel, 0).r * paint.opacity;
-    return vec4f(paint.color * alpha, alpha) + textureLoad(source, pixel, 0) * (1.0 - alpha);
+fn selected(canvas_pixel: vec2i) -> f32 {
+    let pixel = canvas_pixel - paint.selection;
+    if any(pixel < vec2i(0)) || any(pixel >= vec2i(textureDimensions(selection))) {
+        return paint.unselected;
+    }
+    return textureLoad(selection, pixel, 0).r;
+}
+
+fn stroke_weight(in: TileVertex) -> f32 {
+    let pixel = vec2i(in.position.xy);
+    return textureLoad(coverage, pixel, 0).r * paint.opacity * selected(pixel + in.origin);
+}
+
+fn over(top: vec4f, bottom: vec4f) -> vec4f {
+    return top + bottom * (1.0 - top.a);
 }
 
 @fragment
-fn erase_fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
-    let pixel = vec2i(position.xy);
-    let alpha = textureLoad(coverage, pixel, 0).r * paint.opacity;
-    return textureLoad(source, pixel, 0) * (1.0 - alpha);
+fn stroke_fragment(in: TileVertex) -> @location(0) vec4f {
+    let alpha = stroke_weight(in);
+    return over(vec4f(paint.color * alpha, alpha), textureLoad(source, vec2i(in.position.xy), 0));
 }
 
 @fragment
-fn mask_stroke_fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
+fn erase_fragment(in: TileVertex) -> @location(0) vec4f {
+    return textureLoad(source, vec2i(in.position.xy), 0) * (1.0 - stroke_weight(in));
+}
+
+@fragment
+fn mask_stroke_fragment(in: TileVertex) -> @location(0) vec4f {
+    let before = textureLoad(source, vec2i(in.position.xy), 0).a;
+    return vec4f(0.0, 0.0, 0.0, mix(before, paint.color.r, stroke_weight(in)));
+}
+
+@fragment
+fn clone_stroke_fragment(in: TileVertex) -> @location(0) vec4f {
+    let pixel = vec2i(in.position.xy);
+    let copied = textureLoad(replacement, pixel, 0) * stroke_weight(in);
+    return over(copied, textureLoad(source, pixel, 0));
+}
+
+@fragment
+fn replace_stroke_fragment(in: TileVertex) -> @location(0) vec4f {
+    let pixel = vec2i(in.position.xy);
+    let before = textureLoad(source, pixel, 0);
+    return mix(before, textureLoad(replacement, pixel, 0), stroke_weight(in));
+}
+
+// Selected pixels
+@fragment
+fn lift_fragment(in: TileVertex) -> @location(0) vec4f {
+    let pixel = vec2i(in.position.xy);
+    return textureLoad(source, pixel, 0) * selected(pixel + in.origin);
+}
+
+@fragment
+fn drop_fragment(in: TileVertex) -> @location(0) vec4f {
+    let pixel = vec2i(in.position.xy);
+    let left_behind = textureLoad(source, pixel, 0) * (1.0 - selected(pixel + in.origin));
+    return over(textureLoad(replacement, pixel, 0), left_behind);
+}
+
+// Smudge
+struct SmudgeVertex {
+    @builtin(position) position: vec4f,
+    @location(0) offset: vec2f,
+    @location(1) @interpolate(flat) inner: f32,
+    @location(2) @interpolate(flat) flow: f32,
+    @location(3) @interpolate(flat) origin: vec2i,
+    @location(4) @interpolate(flat) delta: vec2i,
+}
+
+@vertex
+fn smudge_vertex(
+    @builtin(vertex_index) index: u32,
+    @location(0) center: vec2f,
+    @location(1) radius: f32,
+    @location(2) inner: f32,
+    @location(3) flow: f32,
+    @location(4) origin: vec2i,
+    @location(5) delta: vec2i,
+) -> SmudgeVertex {
+    let offset = dab_corner(index);
+    let position = dab_position(center, offset, radius);
+    return SmudgeVertex(position, offset, inner, flow, origin, delta);
+}
+
+@fragment
+fn smudge_fragment(in: SmudgeVertex) -> @location(0) vec4f {
+    let pixel = vec2i(in.position.xy);
+    let canvas_pixel = pixel + in.origin;
+    let under = textureLoad(source, pixel, 0);
+    let dragged_from = canvas_pixel - in.delta;
+    if any(dragged_from < vec2i(0)) || any(dragged_from >= paint.canvas) {
+        return under;
+    }
+    let weight = dab_coverage(in.offset, in.inner, in.flow) * paint.opacity * selected(canvas_pixel);
+    return mix(under, textureLoad(replacement, pixel, 0), weight);
+}
+
+// Heal
+struct Heal {
+    origin: vec2i,
+    extent: vec2i,
+    scale: i32,
+}
+
+@group(0) @binding(2) var heal_third: texture_2d<f32>;
+@group(0) @binding(3) var heal_sampler: sampler;
+@group(0) @binding(4) var<uniform> heal: Heal;
+
+const UNCOVERED = 0.002;
+
+@fragment
+fn heal_base_fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
+    let cell = vec2i(position.xy) * heal.scale - heal.origin;
+    var total = vec4f(0.0);
+    for (var y = 0; y < heal.scale; y += 1) {
+        for (var x = 0; x < heal.scale; x += 1) {
+            let pixel = cell + vec2i(x, y);
+            let before = textureLoad(source, pixel, 0);
+            let copied = textureLoad(heal_third, pixel, 0);
+            if before.a > 0.0 && copied.a > 0.0 && textureLoad(coverage, pixel, 0).r < UNCOVERED {
+                total += vec4f(straight_color(before) - straight_color(copied), 1.0);
+            }
+        }
+    }
+    return vec4f(total.rgb / max(total.a, 1.0), min(total.a, 1.0));
+}
+
+@fragment
+fn heal_pull_fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
+    let corner = vec2i(position.xy) * 2;
+    let size = vec2i(textureDimensions(source));
+    var total = vec4f(0.0);
+    for (var index = 0; index < 4; index += 1) {
+        let pixel = corner + vec2i(index & 1, index >> 1u);
+        if all(pixel < size) {
+            let known = textureLoad(source, pixel, 0);
+            total += vec4f(known.rgb * known.a, known.a);
+        }
+    }
+    return vec4f(total.rgb / max(total.a, 1.0), min(total.a, 1.0));
+}
+
+@fragment
+fn heal_push_fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
+    let known = textureLoad(source, vec2i(position.xy), 0);
+    let point = position.xy / (2.0 * vec2f(textureDimensions(coverage)));
+    let guess = textureSampleLevel(coverage, heal_sampler, point, 0.0);
+    return select(vec4f(guess.rgb, 0.0), known, known.a > 0.0);
+}
+
+@fragment
+fn heal_relax_fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
     let pixel = vec2i(position.xy);
-    let weight = textureLoad(coverage, pixel, 0).r * paint.opacity;
-    let before = textureLoad(source, pixel, 0).a;
-    return vec4f(0.0, 0.0, 0.0, mix(before, paint.color.r, weight));
+    let known = textureLoad(source, pixel, 0);
+    if known.a > 0.0 {
+        return known;
+    }
+    let last = vec2i(textureDimensions(source)) - 1;
+    let around = textureLoad(coverage, clamp(pixel + vec2i(1, 0), vec2i(0), last), 0)
+        + textureLoad(coverage, clamp(pixel - vec2i(1, 0), vec2i(0), last), 0)
+        + textureLoad(coverage, clamp(pixel + vec2i(0, 1), vec2i(0), last), 0)
+        + textureLoad(coverage, clamp(pixel - vec2i(0, 1), vec2i(0), last), 0);
+    return vec4f(around.rgb * 0.25, 0.0);
+}
+
+@fragment
+fn heal_fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
+    let pixel = vec2i(position.xy);
+    let before = textureLoad(source, pixel, 0);
+    let copied = textureLoad(coverage, pixel, 0);
+    if before.a == 0.0 || copied.a == 0.0 {
+        return before;
+    }
+    let point = (vec2f(heal.origin) + position.xy) / vec2f(heal.extent);
+    let difference = textureSampleLevel(heal_third, heal_sampler, point, 0.0).rgb;
+    let color = clamp(straight_color(copied) + difference, vec3f(0.0), vec3f(1.0));
+    return vec4f(color * before.a, before.a);
 }
 
 @fragment
@@ -244,13 +420,30 @@ fn mipmap_fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
 struct View {
     pan: vec2f,
     zoom: f32,
-    _padding: f32,
+    has_selection: f32,
+    selection: vec2i,
 }
 
 @group(0) @binding(2) var<uniform> view: View;
 
 const WORKSPACE_COLOR = vec3f(0.09, 0.1, 0.12);
 const CHECKER_SIZE = 8.0;
+
+const DASH_LENGTH = 4;
+
+fn is_selected(point: vec2f) -> bool {
+    let pixel = vec2i(floor(point)) - view.selection;
+    if any(pixel < vec2i(0)) || any(pixel >= vec2i(textureDimensions(selection))) {
+        return false;
+    }
+    return textureLoad(selection, pixel, 0).r >= 0.5;
+}
+
+fn is_outline(point: vec2f) -> bool {
+    let step = vec2f(1.0 / view.zoom, 0.0);
+    return is_selected(point) && !(is_selected(point + step.xy) && is_selected(point - step.xy)
+        && is_selected(point + step.yx) && is_selected(point - step.yx));
+}
 
 @fragment
 fn present_fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
@@ -269,6 +462,11 @@ fn present_fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
             point / document_size,
             -log2(view.zoom),
         );
+    }
+    if view.has_selection > 0.0 && is_outline(point) {
+        let along = vec2i(position.xy);
+        let dash = ((along.x + along.y) / DASH_LENGTH) & 1;
+        return vec4f(vec3f(f32(dash)), 1.0);
     }
     let cell = vec2i(floor(position.xy / CHECKER_SIZE));
     let checker = select(0.8, 1.0, ((cell.x + cell.y) & 1) == 0);

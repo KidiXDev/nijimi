@@ -1,10 +1,46 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
-use crate::{Adjustment, Layer, LayerId, LayerMask, LayerProperties, TILE_BYTES, TileCoord};
+use crate::{
+    Adjustment, Layer, LayerId, LayerMask, LayerProperties, Selection, TILE_BYTES, TextSettings,
+    TileCoord,
+};
 
 pub const DEFAULT_HISTORY_LIMIT: u64 = 256 * 1024 * 1024;
 
 pub type RasterEdit<T> = (LayerId, Vec<(TileCoord, Option<T>)>);
+
+#[derive(Clone, Debug)]
+pub struct PlaneEdit<T> {
+    pub size: (u32, u32),
+    pub rasters: Vec<RasterEdit<T>>,
+    pub masks: Vec<RasterEdit<T>>,
+    pub texts: Vec<(LayerId, Option<TextSettings>)>,
+    pub selection: Option<Option<Arc<Selection>>>,
+}
+
+impl<T> PlaneEdit<T> {
+    pub fn new(size: (u32, u32)) -> Self {
+        Self {
+            size,
+            rasters: Vec::new(),
+            masks: Vec::new(),
+            texts: Vec::new(),
+            selection: None,
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        let tiles = self.rasters.iter().chain(&self.masks).map(|(_, tiles)| {
+            let kept = tiles.iter().filter(|(_, tile)| tile.is_some()).count();
+            tile_bytes(kept) + size_of_val(tiles.as_slice()) as u64
+        });
+        let texts = self.texts.iter().filter_map(|(_, text)| text.as_ref());
+        let selection = self.selection.iter().flatten();
+        tiles.sum::<u64>()
+            + texts.map(TextSettings::bytes).sum::<u64>()
+            + selection.map(|selection| selection.bytes()).sum::<u64>()
+    }
+}
 
 const ENTRY_BYTES: u64 = 512;
 
@@ -27,11 +63,7 @@ pub(crate) enum Edit<T> {
         id: LayerId,
         properties: LayerProperties,
     },
-    Pixels {
-        size: (u32, u32),
-        rasters: Vec<RasterEdit<T>>,
-        masks: Vec<RasterEdit<T>>,
-    },
+    Pixels(PlaneEdit<T>),
     Mask {
         id: LayerId,
         mask: Option<LayerMask<T>>,
@@ -54,18 +86,12 @@ impl<T> Edit<T> {
                             .mask
                             .as_ref()
                             .map_or(0, |mask| tile_bytes(mask.tiles.len()))
+                        + layer.text.as_ref().map_or(0, TextSettings::bytes)
                         + layer.grade().map_or(0, Adjustment::data_bytes);
                 });
                 bytes
             }
-            Self::Pixels { rasters, masks, .. } => rasters
-                .iter()
-                .chain(masks)
-                .map(|(_, tiles)| {
-                    let kept = tiles.iter().filter(|(_, tile)| tile.is_some()).count();
-                    tile_bytes(kept) + size_of_val(tiles.as_slice()) as u64
-                })
-                .sum(),
+            Self::Pixels(edit) => edit.bytes(),
             Self::Mask { mask, .. } => mask.as_ref().map_or(0, |mask| tile_bytes(mask.tiles.len())),
             Self::Adjustment { adjustment, .. } => adjustment.data_bytes(),
             Self::Remove { .. } | Self::Move { .. } | Self::Properties { .. } => 0,

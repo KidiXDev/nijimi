@@ -113,7 +113,7 @@ impl Adjustment {
             Self::Exposure { stops } => (-10.0..=10.0).contains(stops),
             Self::Lut { table } => table.is_valid(),
             Self::Sharpen { amount } => (0.0..=2.0).contains(amount),
-            Self::Blur { radius } => *radius <= 32,
+            Self::Blur { radius } => *radius <= crate::MAX_BLUR_RADIUS,
             Self::Vignette {
                 amount,
                 radius,

@@ -1,9 +1,10 @@
 use futures_channel::mpsc::UnboundedReceiver;
 use nijimi_core::{
     Adjustment, BlendMode, Brush, BrushDynamics, Command, DocumentError, Event, LayerId, PixelRect,
-    Point, ProjectError, StrokePoint, TileCoord, Transform, Viewport,
+    Point, ProjectError, RetouchTool, SelectionMode, SelectionShape, StrokePoint, TextAlign,
+    TextSettings, TileCoord, Transform, Viewport,
 };
-use nijimi_render::{Engine, EngineError, wgpu};
+use nijimi_render::{Engine, EngineError, TextImage, wgpu};
 use pollster::block_on;
 
 const SIZE: (u32, u32) = (600, 300);
@@ -530,22 +531,26 @@ fn assert_pixels_undoable(name: &str, change: impl FnOnce(&mut Editor, LayerId, 
     );
     let layers = editor.engine.document().layers().to_vec();
     let active = editor.engine.document().active();
+    let selection = editor.engine.document().selection().cloned();
     let before = editor.pixels();
 
     change(&mut editor, group, child);
     let changed_layers = editor.engine.document().layers().to_vec();
+    let changed_selection = editor.engine.document().selection().cloned();
     let after = editor.pixels();
 
     editor.dispatch(Command::Undo);
     assert!(editor.pixels() == before, "{name}: undo changed pixels");
     let document = editor.engine.document();
-    assert_eq!(document.active(), active, "{name}: undo changed selection");
+    assert_eq!(document.active(), active, "{name}: undo changed the layer");
+    assert_eq!(document.selection(), selection.as_ref(), "{name}: undo");
     assert!(same_layers(document.layers(), &layers), "{name}: undo");
 
     editor.dispatch(Command::Redo);
     assert!(editor.pixels() == after, "{name}: redo changed pixels");
     let document = editor.engine.document();
     assert!(same_layers(document.layers(), &changed_layers), "{name}");
+    assert_eq!(document.selection(), changed_selection.as_ref(), "{name}");
 }
 
 fn same_layers(
@@ -1231,7 +1236,7 @@ fn fill_and_erase_are_undoable_and_stale_fills_fail() {
     let stale = block_on(job.prepare()).unwrap();
     assert!(matches!(
         editor.engine.commit_fill(stale),
-        Err(EngineError::StaleFill)
+        Err(EngineError::StaleResult)
     ));
     editor.dispatch(Command::Undo);
 
@@ -1898,4 +1903,718 @@ fn painting_under_spatial_adjustments_matches_a_reopened_document() {
         reopened.load(editor.save()).unwrap();
         assert_same(&editor.pixels(), &reopened.pixels());
     }
+}
+
+// Selections
+fn rectangle(x: f32, y: f32, width: f32, height: f32) -> SelectionShape {
+    SelectionShape::Rectangle {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+impl Editor {
+    fn load_image(&mut self, size: (u32, u32)) {
+        self.engine
+            .load_rgba(size.0, size.1, &test_image(size))
+            .expect("load");
+    }
+
+    fn select(&mut self, shape: SelectionShape) {
+        self.dispatch(Command::Select {
+            shape,
+            mode: SelectionMode::Replace,
+        });
+    }
+
+    fn selection_bounds(&self) -> Option<PixelRect> {
+        let selection = self.engine.document().selection();
+        selection.map(|selection| selection.bounds())
+    }
+
+    fn retouch(&mut self, tool: RetouchTool, brush: Brush, points: &[(f32, f32)]) {
+        self.dispatch(Command::RetouchStroke {
+            layer: FIRST_LAYER,
+            tool,
+            brush,
+            points: points.iter().map(|(x, y)| at(*x, *y)).collect(),
+            dynamics: BrushDynamics::default(),
+        });
+    }
+
+    fn fill_at(&mut self, seed: (u32, u32), color: [f32; 4], tolerance: f32) {
+        let job = self
+            .engine
+            .fill(FIRST_LAYER, seed, color, tolerance)
+            .expect("fill");
+        let filled = block_on(job.prepare()).expect("prepare");
+        self.engine.commit_fill(filled).expect("commit");
+    }
+}
+
+fn pixel_rect(x: u32, y: u32, width: u32, height: u32) -> PixelRect {
+    PixelRect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+const SELECTED: PixelRect = PixelRect {
+    x: 240,
+    y: 60,
+    width: 40,
+    height: 50,
+};
+
+fn assert_changed_only_inside(name: &str, before: &[u8], after: &[u8], areas: &[PixelRect]) {
+    let mut changed = 0;
+    for (index, (a, b)) in before.chunks(4).zip(after.chunks(4)).enumerate() {
+        let (x, y) = (index as u32 % SIZE.0, index as u32 / SIZE.0);
+        let inside = areas
+            .iter()
+            .any(|area| area.overlaps(pixel_rect(x, y, 1, 1)));
+        if a != b {
+            assert!(inside, "{name} changed {x}, {y}: {a:?} to {b:?}");
+            changed += 1;
+        }
+    }
+    assert!(changed > 100, "{name} changed {changed} pixels");
+}
+
+#[test]
+fn every_tool_respects_the_selection() {
+    let brush = Brush {
+        diameter: 150.0,
+        color: [0.0, 1.0, 0.0],
+        ..hard_brush()
+    };
+    let path = [(200.0, 85.0), (320.0, 90.0)];
+    let points = || path.map(|(x, y)| at(x, y)).to_vec();
+    let dynamics = BrushDynamics::default();
+    let offset = (30, 40);
+    type Tool<'a> = (&'a str, Box<dyn Fn(&mut Editor) + 'a>);
+    let retouch = |tool| move |editor: &mut Editor| editor.retouch(tool, brush, &path);
+    let tools: [Tool<'_>; 8] = [
+        (
+            "paint",
+            Box::new(|editor| editor.paint(FIRST_LAYER, brush, &path)),
+        ),
+        (
+            "erase",
+            Box::new(|editor| {
+                editor.dispatch(Command::EraseStroke {
+                    layer: FIRST_LAYER,
+                    brush,
+                    points: points(),
+                    dynamics,
+                });
+            }),
+        ),
+        (
+            "mask",
+            Box::new(|editor| {
+                editor.dispatch(Command::PaintMaskStroke {
+                    id: FIRST_LAYER,
+                    value: 0.25,
+                    brush,
+                    points: points(),
+                    dynamics,
+                });
+            }),
+        ),
+        (
+            "fill",
+            Box::new(|editor| editor.fill_at((10, 10), [0.0, 1.0, 0.0, 1.0], 1.0)),
+        ),
+        (
+            "clone",
+            Box::new(retouch(RetouchTool::Clone {
+                offset_x: offset.0,
+                offset_y: offset.1,
+            })),
+        ),
+        (
+            "heal",
+            Box::new(retouch(RetouchTool::Heal {
+                offset_x: offset.0,
+                offset_y: offset.1,
+            })),
+        ),
+        ("smudge", Box::new(retouch(RetouchTool::Smudge))),
+        ("blur", Box::new(retouch(RetouchTool::Blur { radius: 12 }))),
+    ];
+    for (name, run) in tools {
+        let mut editor = Editor::new(SIZE);
+        editor.load_image(SIZE);
+        editor.dispatch(Command::AddMask {
+            id: FIRST_LAYER,
+            reveal: true,
+        });
+        editor.select(rectangle(240.0, 60.0, 40.0, 50.0));
+        let before = editor.pixels();
+        run(&mut editor);
+        let after = editor.pixels();
+        assert_changed_only_inside(name, &before, &after, &[SELECTED]);
+        editor.dispatch(Command::Undo);
+        assert!(editor.pixels() == before, "{name}: undo");
+        editor.dispatch(Command::Redo);
+        assert!(editor.pixels() == after, "{name}: redo");
+    }
+}
+
+#[test]
+fn selection_commands_round_trip_through_undo() {
+    let select = |editor: &mut Editor| editor.select(rectangle(100.0, 100.0, 60.0, 40.0));
+    assert_pixels_undoable("select", |editor, _, _| select(editor));
+    let commands = [
+        Command::Deselect,
+        Command::InvertSelection,
+        Command::FeatherSelection { radius: 5 },
+        Command::GrowSelection { radius: 5 },
+        Command::ShrinkSelection { radius: 5 },
+        Command::MaskFromSelection { id: FIRST_LAYER },
+        Command::Crop {
+            rect: pixel_rect(50, 50, 80, 80),
+        },
+        Command::TransformLayer {
+            id: FIRST_LAYER,
+            transform: Transform {
+                x: 30.0,
+                ..Transform::default()
+            },
+        },
+    ];
+    for command in commands {
+        let name = format!("{command:?}");
+        assert_pixels_undoable(&name, |editor, _, _| {
+            select(editor);
+            let before = editor.engine.document().selection().cloned();
+            let pixels = editor.pixels();
+            editor.dispatch(command);
+            let after = editor.engine.document().selection().cloned();
+            editor.dispatch(Command::Undo);
+            assert_eq!(editor.engine.document().selection(), before.as_ref());
+            assert!(editor.pixels() == pixels);
+            editor.dispatch(Command::Redo);
+            assert_eq!(editor.engine.document().selection(), after.as_ref());
+            editor.dispatch(Command::Undo);
+        });
+    }
+}
+
+#[test]
+fn soft_selections_weigh_each_tool() {
+    let mut editor = Editor::new((300, 20));
+    editor.fill(FIRST_LAYER, [0.0, 0.0, 1.0, 1.0]);
+    editor.select(rectangle(0.5, 0.0, 10.0, 20.0));
+    editor.fill_at((200, 10), [1.0, 0.0, 0.0, 1.0], 0.0);
+    assert_near(&editor.pixel(0, 5), &[128, 0, 127, 255], 1);
+    assert_eq!(editor.pixel(5, 5), [255, 0, 0, 255]);
+    assert_near(&editor.pixel(10, 5), &[128, 0, 127, 255], 1);
+    assert_eq!(editor.pixel(11, 5), [0, 0, 255, 255]);
+    editor.paint(
+        FIRST_LAYER,
+        Brush {
+            diameter: 300.0,
+            color: [0.0, 1.0, 0.0],
+            ..hard_brush()
+        },
+        &[(5.0, 10.0)],
+    );
+    assert_near(&editor.pixel(0, 5), &[64, 128, 63, 255], 1);
+    assert_eq!(editor.pixel(5, 5), [0, 255, 0, 255]);
+}
+
+#[test]
+fn moving_selected_pixels_leaves_the_rest_and_moves_the_selection() {
+    let mut editor = Editor::new(SIZE);
+    editor.load_image(SIZE);
+    let before = editor.pixels();
+    editor.select(rectangle(240.0, 60.0, 40.0, 50.0));
+    let transform = |x, y| Command::TransformLayer {
+        id: FIRST_LAYER,
+        transform: Transform {
+            x,
+            y,
+            ..Transform::default()
+        },
+    };
+    editor.engine.preview(transform(100.0, 20.0)).unwrap();
+    assert_eq!(editor.pixel(250, 70), [0; 4]);
+    editor.engine.cancel_preview();
+    assert_same(&editor.pixels(), &before);
+
+    editor.dispatch(transform(100.0, 20.0));
+    let moved = pixel_rect(340, 80, 40, 50);
+    assert_eq!(editor.selection_bounds(), Some(moved));
+    let after = editor.pixels();
+    assert_changed_only_inside("move", &before, &after, &[SELECTED, moved]);
+    for (x, y) in [(240, 60), (255, 70), (256, 100), (279, 109)] {
+        assert_eq!(pixel_in(&after, SIZE.0, x, y), [0; 4]);
+        assert_eq!(
+            pixel_in(&after, SIZE.0, x + 100, y + 20),
+            pixel_in(&before, SIZE.0, x, y)
+        );
+    }
+    editor.dispatch(Command::Crop {
+        rect: pixel_rect(350, 90, 100, 100),
+    });
+    assert_eq!(editor.selection_bounds(), Some(pixel_rect(0, 0, 30, 40)));
+    editor.dispatch(Command::Undo);
+    editor.dispatch(Command::Undo);
+    assert_same(&editor.pixels(), &before);
+    assert_eq!(editor.selection_bounds(), Some(SELECTED));
+}
+
+#[test]
+fn the_wand_selects_similar_pixels_and_masks_convert_both_ways() {
+    let mut editor = Editor::new(SIZE);
+    editor.fill(FIRST_LAYER, [0.0, 0.0, 1.0, 1.0]);
+    let brush = Brush {
+        diameter: 40.0,
+        ..hard_brush()
+    };
+    editor.paint(FIRST_LAYER, brush, &[(256.0, 100.0)]);
+    editor.paint(FIRST_LAYER, brush, &[(500.0, 100.0)]);
+    let wand = |editor: &mut Editor, contiguous, mode| {
+        let job = editor
+            .engine
+            .select_similar(None, (256, 100), 0.1, contiguous, mode)
+            .unwrap();
+        block_on(job.prepare()).unwrap()
+    };
+    let selected = wand(&mut editor, true, SelectionMode::Replace);
+    editor.engine.commit_selection(selected).unwrap();
+    let dot = editor.selection_bounds().unwrap();
+    assert!((36..=40).contains(&dot.width) && dot.x < 256 && dot.x > 230);
+    let selected = wand(&mut editor, false, SelectionMode::Add);
+    editor.engine.commit_selection(selected).unwrap();
+    assert_eq!(
+        editor.selection_bounds().unwrap().width,
+        500 - 256 + dot.width
+    );
+
+    let stale = wand(&mut editor, true, SelectionMode::Replace);
+    editor.dispatch(Command::InvertSelection);
+    assert!(matches!(
+        editor.engine.commit_selection(stale),
+        Err(EngineError::StaleResult)
+    ));
+    editor.dispatch(Command::FeatherSelection { radius: 8 });
+    let expected = editor.engine.document().selection().cloned();
+    editor.dispatch(Command::MaskFromSelection { id: FIRST_LAYER });
+    assert_eq!(editor.pixel(256, 100)[3], 0);
+    assert_eq!(editor.pixel(100, 100), [0, 0, 255, 255]);
+    editor.dispatch(Command::Deselect);
+    let job = editor
+        .engine
+        .select_mask(FIRST_LAYER, SelectionMode::Replace)
+        .unwrap();
+    let selected = block_on(job.prepare()).unwrap();
+    editor.engine.commit_selection(selected).unwrap();
+    assert_eq!(editor.engine.document().selection(), expected.as_ref());
+}
+
+#[test]
+fn invalid_selections_are_rejected_and_leave_the_document_alone() {
+    let mut editor = Editor::new(SIZE);
+    let mut select = |shape, mode| editor.engine.dispatch(Command::Select { shape, mode });
+    assert!(matches!(
+        select(rectangle(700.0, 0.0, 5.0, 5.0), SelectionMode::Replace),
+        Err(EngineError::Document(DocumentError::EmptySelection))
+    ));
+    assert!(matches!(
+        select(rectangle(f32::NAN, 0.0, 5.0, 5.0), SelectionMode::Replace),
+        Err(EngineError::Document(DocumentError::InvalidSelection))
+    ));
+    select(rectangle(5.0, 5.0, 5.0, 5.0), SelectionMode::Subtract).unwrap();
+    assert!(matches!(
+        select(rectangle(0.0, 0.0, 50.0, 50.0), SelectionMode::Subtract),
+        Err(EngineError::Document(DocumentError::EmptySelection))
+    ));
+    for radius in [0, 501] {
+        assert!(matches!(
+            editor.engine.dispatch(Command::GrowSelection { radius }),
+            Err(EngineError::Document(DocumentError::InvalidSelection))
+        ));
+    }
+    assert_eq!(editor.selection_bounds(), Some(pixel_rect(5, 5, 5, 5)));
+    editor.dispatch(Command::Deselect);
+    for command in [
+        Command::InvertSelection,
+        Command::FeatherSelection { radius: 1 },
+        Command::MaskFromSelection { id: FIRST_LAYER },
+    ] {
+        assert!(matches!(
+            editor.engine.dispatch(command),
+            Err(EngineError::Document(DocumentError::NoSelection))
+        ));
+    }
+}
+
+#[test]
+fn the_selection_outline_is_shown_but_not_exported() {
+    let size = (64, 64);
+    let mut editor = Editor::new(size);
+    editor.fill(FIRST_LAYER, [0.0, 0.0, 1.0, 1.0]);
+    let viewport = Viewport::default();
+    let plain = editor.present(size, &viewport);
+    editor.select(rectangle(10.0, 10.0, 20.0, 20.0));
+    let outlined = editor.present(size, &viewport);
+    for (x, y, is_outline) in [
+        (10, 15, true),
+        (29, 29, true),
+        (9, 15, false),
+        (20, 20, false),
+    ] {
+        let changed = pixel_in(&plain, size.0, x, y) != pixel_in(&outlined, size.0, x, y);
+        assert_eq!(changed, is_outline, "{x}, {y}");
+    }
+    assert_eq!(editor.pixel(10, 15), [0, 0, 255, 255]);
+    editor.dispatch(Command::Deselect);
+    assert_same(&editor.present(size, &viewport), &plain);
+}
+
+// Retouching
+fn gray_image(size: (u32, u32), value: impl Fn(u32, u32) -> u8) -> Vec<u8> {
+    (0..size.1)
+        .flat_map(|y| (0..size.0).map(move |x| (x, y)))
+        .flat_map(|(x, y)| {
+            let value = value(x, y);
+            [value, value, value, 255]
+        })
+        .collect()
+}
+
+#[test]
+fn clone_copies_the_pixels_from_before_the_stroke() {
+    let mut editor = Editor::new(SIZE);
+    editor.load_image(SIZE);
+    let before = editor.pixels();
+    let tool = RetouchTool::Clone {
+        offset_x: -70,
+        offset_y: 25,
+    };
+    let brush = Brush {
+        diameter: 60.0,
+        ..hard_brush()
+    };
+    editor.retouch(tool, brush, &[(260.0, 240.0), (330.0, 240.0)]);
+    let after = editor.pixels();
+    for (x, y) in [(255, 240), (256, 255), (300, 256), (340, 230)] {
+        assert_eq!(
+            pixel_in(&after, SIZE.0, x, y),
+            pixel_in(&before, SIZE.0, x - 70, y + 25),
+            "{x}, {y}"
+        );
+    }
+    assert_eq!(
+        pixel_in(&after, SIZE.0, 260, 150),
+        pixel_in(&before, SIZE.0, 260, 150)
+    );
+}
+
+#[test]
+fn clone_from_outside_the_canvas_paints_nothing() {
+    let mut editor = Editor::new(SIZE);
+    editor.load_image(SIZE);
+    let before = editor.pixels();
+    let tool = RetouchTool::Clone {
+        offset_x: 1000,
+        offset_y: 0,
+    };
+    editor.retouch(tool, hard_brush(), &[(260.0, 240.0)]);
+    assert_same(&editor.pixels(), &before);
+}
+
+#[test]
+fn heal_removes_a_blemish_and_matches_its_surroundings() {
+    let size = (700, 300);
+    let blemish = |x: u32, y: u32| (x as i32 - 256).pow(2) + (y as i32 - 150).pow(2) < 15 * 15;
+    let ramp = |x: u32, y: u32| 40 + x / 4 + y / 10;
+    let grain = |x: u32, y: u32| (x * 7 + y * 13) % 5;
+    let image = gray_image(size, |x, y| {
+        let clean = ramp(x, y) + grain(x, y);
+        if blemish(x, y) { 0 } else { clean as u8 }
+    });
+    for (hardness, offset_x) in [(1.0, 200), (0.4, 200), (1.0, -130)] {
+        let mut editor = Editor::new(size);
+        editor.engine.load_rgba(size.0, size.1, &image).unwrap();
+        let tool = RetouchTool::Heal {
+            offset_x,
+            offset_y: 0,
+        };
+        let brush = Brush {
+            diameter: 70.0,
+            hardness,
+            ..hard_brush()
+        };
+        editor.retouch(tool, brush, &[(256.0, 150.0)]);
+        let pixels = editor.pixels();
+        for (x, y) in [(256, 150), (246, 150), (262, 158), (255, 141), (250, 155)] {
+            let expected = ramp(x, y) as i32 + 2;
+            let actual = i32::from(pixel_in(&pixels, size.0, x, y)[0]);
+            assert!(
+                (actual - expected).abs() <= 6,
+                "{x}, {y}: {actual} {expected}"
+            );
+        }
+        assert_eq!(
+            pixel_in(&pixels, size.0, 320, 150),
+            pixel_in(&image, size.0, 320, 150)
+        );
+    }
+}
+
+#[test]
+fn heal_follows_a_gradient_that_its_source_does_not_have() {
+    let size = (900, 300);
+    let image = gray_image(size, |x, _| if x < 500 { (x / 2) as u8 } else { 128 });
+    let mut editor = Editor::new(size);
+    editor.engine.load_rgba(size.0, size.1, &image).unwrap();
+    let tool = RetouchTool::Heal {
+        offset_x: 450,
+        offset_y: 0,
+    };
+    let brush = Brush {
+        diameter: 120.0,
+        ..hard_brush()
+    };
+    editor.retouch(tool, brush, &[(256.0, 150.0)]);
+    for x in (200..312).step_by(8) {
+        let [value, ..] = editor.pixel(x, 150);
+        assert_near(&[value], &[(x / 2) as u8], 8);
+    }
+}
+
+#[test]
+fn smudge_drags_color_along_the_stroke() {
+    let mut editor = Editor::new(SIZE);
+    let image = gray_image(SIZE, |x, _| if x < 250 { 255 } else { 0 });
+    editor.engine.load_rgba(SIZE.0, SIZE.1, &image).unwrap();
+    let brush = Brush {
+        diameter: 40.0,
+        ..hard_brush()
+    };
+    editor.retouch(
+        RetouchTool::Smudge,
+        brush,
+        &[(230.0, 150.0), (290.0, 150.0)],
+    );
+    assert!(
+        editor.pixel(285, 150)[0] > 200,
+        "{:?}",
+        editor.pixel(285, 150)
+    );
+    assert_eq!(editor.pixel(285, 190), [0, 0, 0, 255]);
+
+    let untouched = editor.pixels();
+    editor.retouch(RetouchTool::Smudge, brush, &[(0.0, 50.0)]);
+    assert_same(&editor.pixels(), &untouched);
+    editor.retouch(RetouchTool::Smudge, brush, &[(0.0, 50.0), (40.0, 50.0)]);
+    assert_eq!(editor.pixel(5, 50), [255, 255, 255, 255]);
+}
+
+#[test]
+fn the_blur_brush_matches_a_blur_adjustment() {
+    let mut editor = Editor::new(SIZE);
+    editor.load_image(SIZE);
+    let before = editor.pixels();
+    let blur = add_adjustment(&mut editor, Adjustment::Blur { radius: 9 });
+    let blurred = editor.pixels();
+    editor.dispatch(Command::DeleteLayer { id: blur });
+    let brush = Brush {
+        diameter: 80.0,
+        ..hard_brush()
+    };
+    editor.retouch(
+        RetouchTool::Blur { radius: 9 },
+        brush,
+        &[(256.0, 250.0), (300.0, 256.0)],
+    );
+    let after = editor.pixels();
+    for (x, y) in [(255, 255), (256, 256), (290, 240)] {
+        let expected = pixel_in(&blurred, SIZE.0, x, y);
+        assert_near(&pixel_in(&after, SIZE.0, x, y), &expected, 1);
+    }
+    assert_eq!(
+        pixel_in(&after, SIZE.0, 400, 250),
+        pixel_in(&before, SIZE.0, 400, 250)
+    );
+}
+
+#[test]
+fn a_cancelled_retouch_stroke_leaves_no_trace() {
+    let tools = [
+        RetouchTool::Heal {
+            offset_x: 50,
+            offset_y: 0,
+        },
+        RetouchTool::Smudge,
+        RetouchTool::Blur { radius: 8 },
+    ];
+    for tool in tools {
+        let mut editor = Editor::new(SIZE);
+        editor.load_image(SIZE);
+        let before = editor.pixels();
+        editor
+            .engine
+            .begin_retouch_stroke(
+                tool,
+                hard_brush(),
+                BrushDynamics::default(),
+                at(250.0, 100.0),
+            )
+            .unwrap();
+        editor.engine.extend_stroke(at(290.0, 140.0));
+        assert!(editor.pixels() != before, "{tool:?}");
+        editor.engine.cancel_stroke();
+        assert!(editor.pixels() == before, "{tool:?}");
+    }
+    let mut editor = Editor::new(SIZE);
+    assert!(matches!(
+        editor.engine.begin_retouch_stroke(
+            RetouchTool::Blur { radius: 33 },
+            hard_brush(),
+            BrushDynamics::default(),
+            at(0.0, 0.0)
+        ),
+        Err(EngineError::InvalidBrush)
+    ));
+}
+
+// Text
+fn sample_text() -> TextSettings {
+    TextSettings {
+        text: "Hi\nthere".into(),
+        position: Point::new(250.0, 100.0),
+        font_family: "Inter".into(),
+        font_size: 24.0,
+        weight: 700,
+        italic: true,
+        color: [1.0, 0.0, 0.0],
+        align: TextAlign::Center,
+        line_height: 1.3,
+        transform: [1.0, 0.0, 0.0, 1.0],
+    }
+}
+
+const TEXT_PIXELS: [u8; 8] = [255, 0, 0, 255, 255, 0, 0, 128];
+
+fn text_image(position: (i32, i32)) -> TextImage<'static> {
+    TextImage {
+        size: (2, 1),
+        rgba: &TEXT_PIXELS,
+        position,
+    }
+}
+
+#[test]
+fn text_layers_stay_editable_after_undo_transform_and_reload() {
+    let mut editor = Editor::new(SIZE);
+    let empty = editor.pixels();
+    let id = editor
+        .engine
+        .add_text(sample_text(), text_image((255, 100)), None, None)
+        .unwrap();
+    assert_eq!(editor.pixel(255, 100), [255, 0, 0, 255]);
+    editor.dispatch(Command::Undo);
+    assert_same(&editor.pixels(), &empty);
+    editor.dispatch(Command::Redo);
+
+    let changed = TextSettings {
+        text: "Bye".into(),
+        ..sample_text()
+    };
+    editor
+        .engine
+        .set_text(id, changed.clone(), text_image((400, 200)))
+        .unwrap();
+    assert_eq!(editor.pixel(255, 100), [0; 4]);
+    assert_eq!(editor.pixel(400, 200), [255, 0, 0, 255]);
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.pixel(255, 100), [255, 0, 0, 255]);
+    let text = |editor: &Editor| editor.engine.document().layer(id).unwrap().text.clone();
+    assert_eq!(text(&editor), Some(sample_text()));
+    editor.dispatch(Command::Redo);
+    assert_eq!(text(&editor), Some(changed.clone()));
+
+    editor.dispatch(Command::TransformLayer {
+        id,
+        transform: Transform {
+            pivot: Some(Point::new(0.0, 0.0)),
+            rotation: 90.0,
+            scale_x: 2.0,
+            x: 500.0,
+            ..Transform::default()
+        },
+    });
+    editor.dispatch(Command::Crop {
+        rect: pixel_rect(10, 20, 500, 200),
+    });
+    let moved = TextSettings {
+        position: Point::new(500.0 - 100.0 - 10.0, 500.0 - 20.0),
+        transform: [0.0, 2.0, -1.0, 0.0],
+        ..changed
+    };
+    assert_eq!(text(&editor), Some(moved.clone()));
+
+    let file = editor.save();
+    editor.load(file).unwrap();
+    assert_eq!(text(&editor), Some(moved));
+}
+
+#[test]
+fn text_layers_reject_pixel_edits_until_rasterized() {
+    let mut editor = Editor::new(SIZE);
+    let id = editor
+        .engine
+        .add_text(sample_text(), text_image((255, 100)), None, None)
+        .unwrap();
+    let is_text = |error| matches!(error, EngineError::Document(DocumentError::TextLayer(found)) if found == id);
+    let stroke = Command::PaintStroke {
+        layer: id,
+        brush: hard_brush(),
+        points: vec![at(255.0, 100.0)],
+        dynamics: BrushDynamics::default(),
+    };
+    assert!(is_text(editor.engine.dispatch(stroke.clone()).unwrap_err()));
+    assert!(
+        editor
+            .engine
+            .fill(id, (0, 0), [0.0; 4], 0.0)
+            .is_err_and(is_text)
+    );
+    editor.select(rectangle(250.0, 90.0, 20.0, 20.0));
+    let transform = Command::TransformLayer {
+        id,
+        transform: Transform {
+            x: 5.0,
+            ..Transform::default()
+        },
+    };
+    assert!(is_text(editor.engine.dispatch(transform).unwrap_err()));
+    editor.dispatch(Command::RasterizeText { id });
+    editor.dispatch(stroke);
+    assert!(matches!(
+        editor
+            .engine
+            .set_text(id, sample_text(), text_image((0, 0))),
+        Err(EngineError::Document(DocumentError::NotAText(_)))
+    ));
+    editor.dispatch(Command::Undo);
+    editor.dispatch(Command::Undo);
+    let invalid = TextSettings {
+        font_size: f32::NAN,
+        ..sample_text()
+    };
+    assert!(matches!(
+        editor.engine.set_text(id, invalid, text_image((0, 0))),
+        Err(EngineError::Document(DocumentError::InvalidText))
+    ));
+    assert_eq!(editor.pixel(255, 100), [255, 0, 0, 255]);
 }
