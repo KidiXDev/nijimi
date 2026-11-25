@@ -1,6 +1,6 @@
 use std::{error::Error, fmt};
 
-use nijimi_core::{DocumentError, ProjectError};
+use nijimi_core::{CubeError, DocumentError, ProjectError};
 
 #[derive(Debug)]
 pub enum EngineError {
@@ -10,6 +10,9 @@ pub enum EngineError {
     PixelCount { expected: u64, actual: u64 },
     NoActiveLayer,
     InvalidBrush,
+    InvalidMaskValue,
+    AdjustmentExport,
+    Cube(CubeError),
     InvalidStroke,
     InvalidRegion,
     InvalidTransform,
@@ -31,12 +34,15 @@ impl fmt::Display for EngineError {
                 write!(formatter, "Images can be at most {limit} px per side.")
             }
             Self::PixelCount { expected, actual } => {
-                write!(
-                    formatter,
-                    "Expected {expected} bytes of RGBA, got {actual}."
-                )
+                write!(formatter, "Expected {expected} pixel bytes, got {actual}.")
             }
             Self::NoActiveLayer => write!(formatter, "No layer is selected."),
+            Self::InvalidMaskValue => write!(formatter, "Mask paint must be between 0 and 1."),
+            Self::AdjustmentExport => write!(
+                formatter,
+                "An adjustment uses the layers below it. Export the composite or its group."
+            ),
+            Self::Cube(error) => error.fmt(formatter),
             Self::InvalidBrush => write!(formatter, "A brush value is out of range."),
             Self::InvalidRegion => write!(formatter, "The region must lie inside the canvas."),
             Self::InvalidTransform => write!(formatter, "A transform value is out of range."),
@@ -60,6 +66,12 @@ impl Error for EngineError {}
 impl From<DocumentError> for EngineError {
     fn from(error: DocumentError) -> Self {
         Self::Document(error)
+    }
+}
+
+impl From<CubeError> for EngineError {
+    fn from(error: CubeError) -> Self {
+        Self::Cube(error)
     }
 }
 

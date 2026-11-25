@@ -52,12 +52,29 @@ struct StrokeTile {
     bindings: wgpu::BindGroup,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum StrokeMode {
+    Paint,
+    Erase,
+    Mask(f32),
+}
+
+impl StrokeMode {
+    pub fn is_mask(self) -> bool {
+        matches!(self, Self::Mask(_))
+    }
+
+    pub fn painting(erase: bool) -> Self {
+        if erase { Self::Erase } else { Self::Paint }
+    }
+}
+
 pub(crate) struct ActiveStroke {
     layer: LayerId,
     stroke: Stroke,
     pending: Vec<Dab>,
     paint: wgpu::Buffer,
-    erase: bool,
+    mode: StrokeMode,
     tiles: BTreeMap<TileCoord, StrokeTile>,
 }
 
@@ -67,7 +84,7 @@ impl ActiveStroke {
         layer: LayerId,
         brush: Brush,
         dynamics: BrushDynamics,
-        erase: bool,
+        mode: StrokeMode,
         start: StrokePoint,
     ) -> Self {
         let (stroke, dab) = Stroke::with_dynamics(brush, dynamics, start);
@@ -76,7 +93,11 @@ impl ActiveStroke {
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("paint"),
                 contents: bytemuck::bytes_of(&PaintUniform {
-                    color: brush.color,
+                    color: if let StrokeMode::Mask(value) = mode {
+                        [value, 0.0, 0.0]
+                    } else {
+                        brush.color
+                    },
                     opacity: brush.opacity,
                 }),
                 usage: wgpu::BufferUsages::UNIFORM,
@@ -86,7 +107,7 @@ impl ActiveStroke {
             stroke,
             pending: vec![dab],
             paint,
-            erase,
+            mode,
             tiles: BTreeMap::new(),
         }
     }
@@ -103,8 +124,12 @@ impl ActiveStroke {
         self.layer
     }
 
-    pub fn result(&self, layer: LayerId, coord: TileCoord) -> Option<&TileRef> {
-        if layer != self.layer {
+    pub fn is_mask(&self) -> bool {
+        self.mode.is_mask()
+    }
+
+    pub fn result(&self, layer: LayerId, coord: TileCoord, mask: bool) -> Option<&TileRef> {
+        if layer != self.layer || self.is_mask() != mask {
             return None;
         }
         self.tiles.get(&coord).map(|tile| &tile.result)
@@ -129,13 +154,18 @@ impl ActiveStroke {
         gpu: &Gpu,
         encoder: &mut wgpu::CommandEncoder,
         document_size: (u32, u32),
-        before: &Tiles<TileRef>,
+        (before, reveal): (&Tiles<TileRef>, bool),
         coverage_pool: &mut Vec<Tile>,
     ) -> BTreeSet<TileCoord> {
         let mut dabs_by_tile: BTreeMap<TileCoord, Vec<DabInstance>> = BTreeMap::new();
         for dab in mem::take(&mut self.pending) {
             for coord in dab.tiles(document_size) {
-                if self.erase && !before.contains_key(&coord) {
+                let default_only = match self.mode {
+                    StrokeMode::Paint => false,
+                    StrokeMode::Erase => true,
+                    StrokeMode::Mask(value) => value == f32::from(u8::from(reveal)),
+                };
+                if default_only && !before.contains_key(&coord) {
                     continue;
                 }
                 let instance = DabInstance::new(&dab, coord);
@@ -157,7 +187,10 @@ impl ActiveStroke {
         let mut first = 0;
         for (coord, dabs) in &dabs_by_tile {
             let tile = self.tiles.entry(*coord).or_insert_with(|| {
-                StrokeTile::new(gpu, before.get(coord), &self.paint, coverage_pool)
+                let source = before
+                    .get(coord)
+                    .unwrap_or_else(|| gpu.mask_default(reveal));
+                StrokeTile::new(gpu, source, &self.paint, coverage_pool)
             });
             let (width, height) = coord.visible_size(document_size);
             let last = first + dabs.len() as u32;
@@ -176,10 +209,10 @@ impl ActiveStroke {
             draw_fullscreen(
                 encoder,
                 tile.result.view(),
-                if self.erase {
-                    &gpu.pipelines.erase
-                } else {
-                    &gpu.pipelines.stroke
+                match self.mode {
+                    StrokeMode::Paint => &gpu.pipelines.stroke,
+                    StrokeMode::Erase => &gpu.pipelines.erase,
+                    StrokeMode::Mask(_) => &gpu.pipelines.mask_stroke,
                 },
                 &tile.bindings,
             );
@@ -192,7 +225,7 @@ impl ActiveStroke {
 impl StrokeTile {
     fn new(
         gpu: &Gpu,
-        before: Option<&TileRef>,
+        before: &TileRef,
         paint: &wgpu::Buffer,
         coverage_pool: &mut Vec<Tile>,
     ) -> Self {
@@ -202,7 +235,7 @@ impl StrokeTile {
         let bindings = gpu.bind(
             &gpu.layouts.stroke,
             &[
-                TextureView(before.unwrap_or(&gpu.empty_tile).view()),
+                TextureView(before.view()),
                 TextureView(coverage.view()),
                 paint.as_entire_binding(),
             ],

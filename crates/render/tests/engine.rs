@@ -1,7 +1,7 @@
 use futures_channel::mpsc::UnboundedReceiver;
 use nijimi_core::{
-    BlendMode, Brush, BrushDynamics, Command, DocumentError, Event, LayerId, PixelRect, Point,
-    ProjectError, StrokePoint, TileCoord, Transform, Viewport,
+    Adjustment, BlendMode, Brush, BrushDynamics, Command, DocumentError, Event, LayerId, PixelRect,
+    Point, ProjectError, StrokePoint, TileCoord, Transform, Viewport,
 };
 use nijimi_render::{Engine, EngineError, wgpu};
 use pollster::block_on;
@@ -1262,4 +1262,415 @@ fn fill_and_erase_are_undoable_and_stale_fills_fail() {
     assert_eq!(editor.pixels(), filled);
     editor.dispatch(Command::Redo);
     assert_eq!(editor.pixels(), erased);
+}
+
+fn add_adjustment(editor: &mut Editor, adjustment: Adjustment) -> LayerId {
+    editor
+        .dispatch(Command::AddAdjustment {
+            name: None,
+            parent: None,
+            index: None,
+            adjustment,
+        })
+        .unwrap()
+}
+
+#[test]
+fn painted_masks_preview_undo_resize_and_reopen() {
+    let mut editor = Editor::new((265, 6));
+    let layer = editor
+        .engine
+        .import_rgba((4, 1), &[255, 40, 60, 255].repeat(4), (254, 2), None, None)
+        .unwrap();
+    let unmasked = editor.pixels();
+    editor.dispatch(Command::AddMask {
+        id: layer,
+        reveal: false,
+    });
+    assert_eq!(editor.pixel(255, 2), [0; 4]);
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.pixels(), unmasked);
+    editor.dispatch(Command::Redo);
+    assert_eq!(editor.pixel(255, 2), [0; 4]);
+
+    let brush = Brush {
+        diameter: 2.0,
+        opacity: 1.0,
+        ..hard_brush()
+    };
+    editor
+        .engine
+        .begin_mask_stroke(layer, brush, BrushDynamics::default(), 0.5, at(255.5, 2.5))
+        .unwrap();
+    assert_near(&editor.pixel(255, 2), &[255, 40, 60, 128], 1);
+    editor.engine.cancel_stroke();
+    assert_eq!(editor.pixel(255, 2), [0; 4]);
+    editor.dispatch(Command::PaintMaskStroke {
+        id: layer,
+        value: 0.5,
+        brush,
+        points: vec![at(255.5, 2.5)],
+        dynamics: BrushDynamics::default(),
+    });
+    assert_near(&editor.pixel(255, 2), &[255, 40, 60, 128], 1);
+    let painted = editor.pixels();
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.pixel(255, 2), [0; 4]);
+    editor.dispatch(Command::Redo);
+    assert_eq!(editor.pixels(), painted);
+
+    editor.dispatch(Command::ExtendCanvas {
+        left: 2,
+        top: 1,
+        right: 0,
+        bottom: 0,
+    });
+    assert_near(&editor.pixel(257, 3), &[255, 40, 60, 128], 1);
+    assert_eq!(editor.pixel(255, 3), [0; 4]);
+    let extended = editor.pixels();
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.pixels(), painted);
+    editor.dispatch(Command::Redo);
+    assert_eq!(editor.pixels(), extended);
+
+    let saved = editor.save();
+    editor.load(saved).unwrap();
+    assert_eq!(editor.pixels(), extended);
+    let mask = block_on(
+        editor
+            .engine
+            .read_mask(
+                layer,
+                Some(PixelRect {
+                    x: 257,
+                    y: 3,
+                    width: 1,
+                    height: 1,
+                }),
+            )
+            .unwrap()
+            .pixels(),
+    )
+    .unwrap();
+    assert_near(&mask, &[0, 0, 0, 128], 1);
+    editor.dispatch(Command::RemoveMask { id: layer });
+    assert_eq!(editor.pixel(257, 3), [255, 40, 60, 255]);
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.pixels(), extended);
+    editor.dispatch(Command::Redo);
+    assert_eq!(editor.pixel(257, 3), [255, 40, 60, 255]);
+
+    let mut alpha = vec![0; 267 * 7];
+    alpha[3 * 267 + 257] = 37;
+    editor.engine.set_mask_alpha(layer, &alpha).unwrap();
+    assert_near(&editor.pixel(257, 3), &[255, 40, 60, 37], 1);
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.pixel(257, 3), [255, 40, 60, 255]);
+    editor.dispatch(Command::Redo);
+    assert_near(&editor.pixel(257, 3), &[255, 40, 60, 37], 1);
+}
+
+#[test]
+fn adjustment_previews_follow_stack_scope_and_mask() {
+    let mut editor = Editor::new((20, 4));
+    editor
+        .engine
+        .load_rgba(20, 4, &[128, 128, 128, 255].repeat(80))
+        .unwrap();
+    let original = editor.pixels();
+    let layer = add_adjustment(&mut editor, Adjustment::Exposure { stops: 1.0 });
+    assert_near(&editor.pixel(0, 0), &[176, 176, 176, 255], 1);
+    editor.dispatch(Command::AddMask {
+        id: layer,
+        reveal: false,
+    });
+    assert_eq!(editor.pixels(), original);
+    editor.dispatch(Command::PaintMaskStroke {
+        id: layer,
+        value: 1.0,
+        brush: Brush {
+            diameter: 2.0,
+            ..hard_brush()
+        },
+        points: vec![at(2.5, 0.5)],
+        dynamics: BrushDynamics::default(),
+    });
+    assert_near(&editor.pixel(2, 0), &[176, 176, 176, 255], 1);
+    assert_eq!(editor.pixel(0, 0), [128, 128, 128, 255]);
+    editor
+        .engine
+        .import_rgba((1, 1), &[92, 40, 70, 255], (5, 0), None, None)
+        .unwrap();
+    let before = editor.pixels();
+    let preview = |stops| Command::SetAdjustment {
+        id: layer,
+        adjustment: Adjustment::Exposure { stops },
+    };
+    editor.engine.preview(preview(2.0)).unwrap();
+    assert_near(&editor.pixel(2, 0), &[239, 239, 239, 255], 1);
+    editor.engine.preview(preview(-1.0)).unwrap();
+    assert_near(&editor.pixel(2, 0), &[92, 92, 92, 255], 1);
+    assert_eq!(editor.pixel(5, 0), [92, 40, 70, 255]);
+    editor.engine.commit_preview().unwrap();
+    let revised = editor.pixels();
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.pixels(), before);
+    editor.dispatch(Command::Redo);
+    assert_eq!(editor.pixels(), revised);
+
+    let histogram = block_on(
+        editor
+            .engine
+            .read_region(Some(PixelRect {
+                x: 5,
+                y: 0,
+                width: 1,
+                height: 1,
+            }))
+            .unwrap()
+            .histogram(),
+    )
+    .unwrap();
+    assert_eq!(histogram.pixels, 1);
+    assert_eq!(histogram.red[92], 1);
+    assert_eq!(histogram.green[40], 1);
+    assert_eq!(histogram.blue[70], 1);
+}
+
+#[test]
+fn adjustments_stay_editable_after_project_reload() {
+    use Adjustment::*;
+    let mut editor = Editor::new((32, 12));
+    let pixels: Vec<_> = (0..384)
+        .flat_map(|i| {
+            if i % 11 == 0 {
+                [0, 0, 0, 0]
+            } else {
+                [
+                    80 + (i % 127) as u8,
+                    120 - (i % 51) as u8,
+                    10 + (i % 87) as u8,
+                    255,
+                ]
+            }
+        })
+        .collect();
+
+    for (adjustment, neutral) in [
+        (
+            BrightnessContrast {
+                brightness: 0.15,
+                contrast: 0.25,
+            },
+            BrightnessContrast {
+                brightness: 0.0,
+                contrast: 0.0,
+            },
+        ),
+        (
+            Levels {
+                black: 0.05,
+                white: 0.9,
+                gamma: 1.2,
+                output_black: 0.1,
+                output_white: 0.8,
+            },
+            Levels {
+                black: 0.0,
+                white: 1.0,
+                gamma: 1.0,
+                output_black: 0.0,
+                output_white: 1.0,
+            },
+        ),
+        (
+            Curves {
+                points: vec![
+                    Point::new(0.0, 0.0),
+                    Point::new(0.4, 0.7),
+                    Point::new(1.0, 1.0),
+                ],
+            },
+            Curves {
+                points: vec![Point::new(0.0, 0.0), Point::new(1.0, 1.0)],
+            },
+        ),
+        (
+            Hsl {
+                hue: 120.0,
+                saturation: 0.2,
+                lightness: 0.1,
+            },
+            Hsl {
+                hue: 0.0,
+                saturation: 0.0,
+                lightness: 0.0,
+            },
+        ),
+        (
+            ColorBalance {
+                shadows: [0.3, 0.0, -0.2],
+                midtones: [0.0, 0.2, 0.0],
+                highlights: [0.1, 0.0, 0.1],
+            },
+            ColorBalance {
+                shadows: [0.0; 3],
+                midtones: [0.0; 3],
+                highlights: [0.0; 3],
+            },
+        ),
+        (Exposure { stops: 1.0 }, Exposure { stops: 0.0 }),
+        (Sharpen { amount: 0.7 }, Sharpen { amount: 0.0 }),
+        (Blur { radius: 3 }, Blur { radius: 0 }),
+        (
+            Vignette {
+                amount: 0.9,
+                radius: 0.1,
+                feather: 0.5,
+            },
+            Vignette {
+                amount: 0.0,
+                radius: 0.1,
+                feather: 0.5,
+            },
+        ),
+        (
+            Grain {
+                amount: 0.9,
+                seed: 42,
+            },
+            Grain {
+                amount: 0.0,
+                seed: 42,
+            },
+        ),
+    ] {
+        editor.engine.load_rgba(32, 12, &pixels).unwrap();
+        let baseline = editor.pixels();
+        let id = add_adjustment(&mut editor, adjustment.clone());
+        let graded = editor.pixels();
+        assert!(graded != baseline, "{adjustment:?} had no effect");
+        editor.dispatch(Command::Undo);
+        assert_eq!(editor.pixels(), baseline);
+        editor.dispatch(Command::Redo);
+        assert_eq!(editor.pixels(), graded);
+
+        let file = editor.save();
+        editor.load(file).unwrap();
+        assert_eq!(
+            editor.engine.document().layer(id).unwrap().grade(),
+            Some(&adjustment)
+        );
+        assert_eq!(editor.pixels(), graded);
+        editor.dispatch(Command::SetAdjustment {
+            id,
+            adjustment: neutral,
+        });
+        let revised = editor.pixels();
+        assert_near(&revised, &baseline, 1);
+        editor.dispatch(Command::Undo);
+        assert_eq!(editor.pixels(), graded);
+        editor.dispatch(Command::Redo);
+        assert_eq!(editor.pixels(), revised);
+    }
+}
+
+#[test]
+fn cube_luts_preserve_table_order_and_can_be_replaced_after_reload() {
+    let mut editor = Editor::new((4, 1));
+    editor
+        .engine
+        .load_rgba(4, 1, &[64, 128, 192, 255].repeat(4))
+        .unwrap();
+    let source = "TITLE \"BGR swap\"\nLUT_3D_SIZE 2\n1 0 0\n0 0 0\n1 0 1\n0 0 1\n1 1 0\n0 1 0\n1 1 1\n0 1 1\n";
+    let id = editor.engine.import_cube_lut(source, None, None).unwrap();
+    assert_eq!(
+        editor.engine.document().layer(id).unwrap().properties.name,
+        "BGR swap"
+    );
+    assert_near(&editor.pixel(0, 0), &[191, 192, 128, 255], 1);
+    let graded = editor.pixels();
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.pixel(0, 0), [64, 128, 192, 255]);
+    editor.dispatch(Command::Redo);
+    assert_eq!(editor.pixels(), graded);
+
+    let saved = editor.save();
+    editor.load(saved).unwrap();
+    assert_eq!(editor.pixels(), graded);
+    assert!(
+        editor
+            .engine
+            .set_cube_lut(id, "LUT_1D_SIZE 2\n0 0 0")
+            .is_err()
+    );
+    assert_eq!(editor.pixels(), graded);
+    editor
+        .engine
+        .set_cube_lut(id, "LUT_1D_SIZE 2\n0 1 0\n1 0 1")
+        .unwrap();
+    assert_near(&editor.pixel(0, 0), &[64, 127, 192, 255], 1);
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.pixels(), graded);
+    editor.dispatch(Command::Redo);
+    assert_near(&editor.pixel(0, 0), &[64, 127, 192, 255], 1);
+}
+
+#[test]
+fn blur_crosses_both_tile_axes_inside_an_isolated_group() {
+    let mut editor = Editor::new((263, 263));
+    editor
+        .engine
+        .import_rgba((1, 1), &[0, 255, 0, 255], (257, 255), None, None)
+        .unwrap();
+    let group = editor
+        .dispatch(Command::AddGroup {
+            name: None,
+            parent: None,
+            index: None,
+        })
+        .unwrap();
+    let place = Some(nijimi_core::LayerPlace {
+        parent: Some(group),
+        index: 0,
+    });
+    editor
+        .engine
+        .import_rgba((1, 1), &[255, 0, 0, 255], (255, 255), None, place)
+        .unwrap();
+    editor
+        .engine
+        .import_rgba((1, 1), &[255, 0, 0, 255], (30, 30), None, place)
+        .unwrap();
+    let blur = editor
+        .dispatch(Command::AddAdjustment {
+            name: None,
+            parent: Some(Some(group)),
+            index: None,
+            adjustment: Adjustment::Blur { radius: 3 },
+        })
+        .unwrap();
+    let graded = editor.pixels();
+    let seam = pixel_in(&graded, 263, 256, 256);
+    assert!(seam[3] > 0);
+    assert_eq!(seam, pixel_in(&graded, 263, 31, 31));
+    assert_eq!(pixel_in(&graded, 263, 257, 254)[1], 0);
+    assert!(pixel_in(&graded, 263, 257, 255)[1] > 0);
+
+    editor.dispatch(Command::SetLayerVisible {
+        id: blur,
+        visible: false,
+    });
+    assert_eq!(editor.pixel(256, 256), [0; 4]);
+    assert_eq!(editor.pixel(257, 255), [0, 255, 0, 255]);
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.pixels(), graded);
+
+    editor.dispatch(Command::AddMask {
+        id: group,
+        reveal: false,
+    });
+    assert_eq!(editor.pixel(256, 256), [0; 4]);
+    editor.dispatch(Command::Undo);
+    assert_eq!(editor.pixels(), graded);
 }

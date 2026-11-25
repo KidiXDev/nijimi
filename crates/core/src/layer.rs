@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::TileCoord;
+use crate::{Adjustment, TileCoord};
 
 pub type LayerId = u32;
 pub type Tiles<T> = BTreeMap<TileCoord, T>;
@@ -65,12 +65,20 @@ pub struct Layer<T> {
     pub id: LayerId,
     pub properties: LayerProperties,
     pub content: LayerContent<T>,
+    pub mask: Option<LayerMask<T>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerMask<T> {
+    pub reveal: bool,
+    pub tiles: Tiles<T>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerContent<T> {
     Raster(Tiles<T>),
     Group(Vec<Layer<T>>),
+    Adjustment(Adjustment),
 }
 
 impl<T> Layer<T> {
@@ -79,6 +87,7 @@ impl<T> Layer<T> {
             id,
             properties: LayerProperties::named(name),
             content: LayerContent::Raster(Tiles::new()),
+            mask: None,
         }
     }
 
@@ -87,20 +96,41 @@ impl<T> Layer<T> {
             id,
             properties: LayerProperties::named(name),
             content: LayerContent::Group(Vec::new()),
+            mask: None,
         }
+    }
+
+    pub fn adjustment(id: LayerId, name: String, adjustment: Adjustment) -> Self {
+        Self {
+            id,
+            properties: LayerProperties::named(name),
+            content: LayerContent::Adjustment(adjustment),
+            mask: None,
+        }
+    }
+
+    pub fn grade(&self) -> Option<&Adjustment> {
+        match &self.content {
+            LayerContent::Adjustment(adjustment) => Some(adjustment),
+            _ => None,
+        }
+    }
+
+    pub fn has_adjustments(&self) -> bool {
+        self.grade().is_some() || self.children().iter().any(Self::has_adjustments)
     }
 
     pub fn children(&self) -> &[Self] {
         match &self.content {
             LayerContent::Group(children) => children,
-            LayerContent::Raster(_) => &[],
+            _ => &[],
         }
     }
 
     pub fn tiles(&self) -> Option<&Tiles<T>> {
         match &self.content {
             LayerContent::Raster(tiles) => Some(tiles),
-            LayerContent::Group(_) => None,
+            _ => None,
         }
     }
 
@@ -117,30 +147,45 @@ impl<T> Layer<T> {
 
     pub fn group_depth(&self) -> usize {
         match &self.content {
-            LayerContent::Raster(_) => 0,
             LayerContent::Group(children) => {
                 1 + children.iter().map(Self::group_depth).max().unwrap_or(0)
             }
+            _ => 0,
         }
     }
 
     pub fn map_tiles<U>(&self, convert: &mut impl FnMut(LayerId, TileCoord, &T) -> U) -> Layer<U> {
+        self.map_planes(&mut |id, coord, _, tile| convert(id, coord, tile))
+    }
+
+    pub fn map_planes<U>(
+        &self,
+        convert: &mut impl FnMut(LayerId, TileCoord, bool, &T) -> U,
+    ) -> Layer<U> {
+        let mut plane = |tiles: &Tiles<T>, is_mask| {
+            tiles
+                .iter()
+                .map(|(coord, tile)| (*coord, convert(self.id, *coord, is_mask, tile)))
+                .collect()
+        };
         Layer {
             id: self.id,
             properties: self.properties.clone(),
+            mask: self.mask.as_ref().map(|mask| LayerMask {
+                reveal: mask.reveal,
+                tiles: plane(&mask.tiles, true),
+            }),
             content: match &self.content {
-                LayerContent::Raster(tiles) => LayerContent::Raster(
-                    tiles
-                        .iter()
-                        .map(|(coord, tile)| (*coord, convert(self.id, *coord, tile)))
-                        .collect(),
-                ),
+                LayerContent::Raster(tiles) => LayerContent::Raster(plane(tiles, false)),
                 LayerContent::Group(children) => LayerContent::Group(
                     children
                         .iter()
-                        .map(|child| child.map_tiles(convert))
+                        .map(|child| child.map_planes(convert))
                         .collect(),
                 ),
+                LayerContent::Adjustment(adjustment) => {
+                    LayerContent::Adjustment(adjustment.clone())
+                }
             },
         }
     }

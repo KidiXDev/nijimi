@@ -1,10 +1,11 @@
-use std::{collections::BTreeSet, rc::Rc};
+use std::{collections::BTreeSet, rc::Rc, sync::Arc};
 
 use bytemuck::{Pod, Zeroable};
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use nijimi_core::{
-    Brush, BrushDynamics, Command, Document, DocumentError, Event, Layer, LayerContent, LayerId,
-    LayerPlace, PixelRect, RasterEdit, StrokePoint, TileCoord, Tiles, Viewport,
+    Adjustment, Brush, BrushDynamics, Command, CubeLut, Document, DocumentError, Event, Layer,
+    LayerContent, LayerId, LayerMask, LayerPlace, PixelRect, RasterEdit, StrokePoint, TILE_SIZE,
+    TileCoord, Tiles, Viewport,
 };
 use wgpu::{BindingResource::TextureView, util::DeviceExt};
 
@@ -16,7 +17,7 @@ use crate::{
     gpu::{CLEAR, Gpu, IMAGE_FORMAT, begin_pass, draw_fullscreen, texture_descriptor},
     project::{LoadedProject, ProjectLoader, ProjectSnapshot},
     readback::Readback,
-    stroke::ActiveStroke,
+    stroke::{ActiveStroke, StrokeMode},
     tile::{Tile, TileRef},
 };
 
@@ -37,9 +38,14 @@ enum PreviewEdit {
         id: LayerId,
         opacity: f32,
     },
-    Rasters {
+    Adjustment {
+        id: LayerId,
+        adjustment: Adjustment,
+    },
+    Pixels {
         size: (u32, u32),
-        layers: Vec<RasterEdit<TileRef>>,
+        rasters: Vec<RasterEdit<TileRef>>,
+        masks: Vec<RasterEdit<TileRef>>,
     },
 }
 
@@ -47,7 +53,12 @@ impl PreviewEdit {
     fn apply(self, document: &mut Document<TileRef>) -> Result<(), DocumentError> {
         match self {
             Self::Opacity { id, opacity } => document.set_layer_opacity(id, opacity),
-            Self::Rasters { size, layers } => document.replace_rasters(size, layers),
+            Self::Adjustment { id, adjustment } => document.set_adjustment(id, adjustment),
+            Self::Pixels {
+                size,
+                rasters,
+                masks,
+            } => document.replace_planes(size, rasters, masks),
         }
     }
 }
@@ -199,7 +210,20 @@ impl Engine {
         self.end_stroke()?;
         self.cancel_preview();
         let layer = self.document.active().ok_or(EngineError::NoActiveLayer)?;
-        self.begin_stroke_on(layer, brush, dynamics, erase, start)
+        self.begin_stroke_on(layer, brush, dynamics, StrokeMode::painting(erase), start)
+    }
+
+    pub fn begin_mask_stroke(
+        &mut self,
+        id: LayerId,
+        brush: Brush,
+        dynamics: BrushDynamics,
+        value: f32,
+        start: StrokePoint,
+    ) -> Result<(), EngineError> {
+        self.end_stroke()?;
+        self.cancel_preview();
+        self.begin_stroke_on(id, brush, dynamics, StrokeMode::Mask(value), start)
     }
 
     pub fn extend_stroke(&mut self, point: StrokePoint) {
@@ -216,8 +240,13 @@ impl Engine {
         }
         if let Some(stroke) = self.stroke.take() {
             let layer = stroke.layer();
+            let mask = stroke.is_mask();
             let tiles = stroke.finish(&mut self.coverage_pool);
-            self.document.replace_tiles(layer, tiles)?;
+            if mask {
+                self.document.replace_mask_tiles(layer, tiles)?;
+            } else {
+                self.document.replace_tiles(layer, tiles)?;
+            }
             self.document.take_dirty();
             self.publish_events();
         }
@@ -233,9 +262,9 @@ impl Engine {
 
     pub fn load_rgba(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<(), EngineError> {
         let size = (width, height);
-        self.check_rgba(size, rgba)?;
+        self.check_pixels(size, rgba, RGBA_BYTES)?;
         let mut layer = Layer::raster(FIRST_LAYER, "Background".into());
-        layer.content = LayerContent::Raster(self.import_tiles(size, rgba, size, (0, 0)));
+        layer.content = LayerContent::Raster(self.import_tiles(size, rgba, size, (0, 0), false));
         let document = Document::with_layers(size, vec![layer], Some(FIRST_LAYER))?;
         let composite = Composite::new(&self.gpu, size, &self.view_buffer);
         self.open(LoadedProject {
@@ -253,21 +282,44 @@ impl Engine {
         name: Option<String>,
         place: Option<LayerPlace>,
     ) -> Result<LayerId, EngineError> {
-        self.check_rgba(size, rgba)?;
+        self.check_pixels(size, rgba, RGBA_BYTES)?;
         self.end_stroke()?;
         self.cancel_preview();
-        let tiles = self.import_tiles(size, rgba, self.document.size(), position);
+        let tiles = self.import_tiles(size, rgba, self.document.size(), position, false);
         let id = self.document.add_raster(name, place, tiles)?;
         self.publish_events();
         Ok(id)
     }
 
-    fn check_rgba(&self, size: (u32, u32), rgba: &[u8]) -> Result<(), EngineError> {
+    pub fn set_mask_alpha(&mut self, id: LayerId, alpha: &[u8]) -> Result<(), EngineError> {
+        let size = self.document.size();
+        self.check_pixels(size, alpha, 1)?;
+        self.document.layer(id)?;
+        self.end_stroke()?;
+        self.cancel_preview();
+        let tiles = self.import_tiles(size, alpha, size, (0, 0), true);
+        self.document.replace_mask(
+            id,
+            LayerMask {
+                reveal: false,
+                tiles,
+            },
+        )?;
+        self.publish_events();
+        Ok(())
+    }
+
+    fn check_pixels(
+        &self,
+        size: (u32, u32),
+        pixels: &[u8],
+        channels: usize,
+    ) -> Result<(), EngineError> {
         self.gpu.check_device()?;
         self.gpu.check_size(size)?;
         let (width, height) = size;
-        let expected = u64::from(width) * u64::from(height) * RGBA_BYTES as u64;
-        let actual = rgba.len() as u64;
+        let expected = u64::from(width) * u64::from(height) * channels as u64;
+        let actual = pixels.len() as u64;
         if actual != expected {
             return Err(EngineError::PixelCount { expected, actual });
         }
@@ -323,6 +375,35 @@ impl Engine {
         }
         self.document.replace_tiles(result.id, result.tiles)?;
         self.publish_events();
+        Ok(())
+    }
+
+    pub fn import_cube_lut(
+        &mut self,
+        text: &str,
+        name: Option<String>,
+        place: Option<LayerPlace>,
+    ) -> Result<LayerId, EngineError> {
+        let table = CubeLut::parse(text)?;
+        let name = name.or_else(|| table.info.title.clone());
+        self.end_stroke()?;
+        self.cancel_preview();
+        let id = self.document.add_adjustment(
+            name,
+            place,
+            Adjustment::Lut {
+                table: Arc::new(table),
+            },
+        )?;
+        self.publish_events();
+        Ok(id)
+    }
+
+    pub fn set_cube_lut(&mut self, id: LayerId, text: &str) -> Result<(), EngineError> {
+        let adjustment = Adjustment::Lut {
+            table: Arc::new(CubeLut::parse(text)?),
+        };
+        self.dispatch(Command::SetAdjustment { id, adjustment })?;
         Ok(())
     }
 
@@ -400,7 +481,9 @@ impl Engine {
     ) -> Result<Readback, EngineError> {
         let size = self.document().size();
         let rect = checked_region(size, region)?;
-        self.document().layer(id)?;
+        if self.document().layer(id)?.grade().is_some() {
+            return Err(EngineError::AdjustmentExport);
+        }
         self.flush()?;
         let mut layer = self.document().layer(id)?.clone();
         layer.properties.visible = true;
@@ -416,6 +499,49 @@ impl Engine {
         if !dirty.is_empty() {
             self.gpu.submit(|encoder| {
                 composite.update(&self.gpu, encoder, &document, self.stroke.as_ref(), &dirty);
+            });
+        }
+        Ok(self.export_view(composite.view(), rect))
+    }
+
+    pub fn read_mask(
+        &mut self,
+        id: LayerId,
+        region: Option<PixelRect>,
+    ) -> Result<Readback, EngineError> {
+        let size = self.document().size();
+        let rect = checked_region(size, region)?;
+        self.flush()?;
+        let mask = self
+            .document()
+            .layer(id)?
+            .mask
+            .as_ref()
+            .ok_or(DocumentError::NoMask(id))?;
+        let coords =
+            (rect.y / TILE_SIZE..(rect.y + rect.height).div_ceil(TILE_SIZE)).flat_map(|y| {
+                (rect.x / TILE_SIZE..(rect.x + rect.width).div_ceil(TILE_SIZE))
+                    .map(move |x| TileCoord::new(x, y))
+            });
+        let tiles = coords
+            .filter_map(|coord| {
+                let tile = self
+                    .stroke
+                    .as_ref()
+                    .and_then(|stroke| stroke.result(id, coord, true))
+                    .or(mask.tiles.get(&coord));
+                tile.or_else(|| mask.reveal.then(|| self.gpu.mask_default(true)))
+                    .map(|tile| (coord, tile.clone()))
+            })
+            .collect();
+        let mut layer = Layer::raster(id, String::new());
+        layer.content = LayerContent::Raster(tiles);
+        let mut document = Document::with_layers(size, vec![layer], Some(id))?;
+        let dirty = document.take_dirty();
+        let mut composite = Composite::new(&self.gpu, size, &self.view_buffer);
+        if !dirty.is_empty() {
+            self.gpu.submit(|encoder| {
+                composite.update(&self.gpu, encoder, &document, None, &dirty);
             });
         }
         Ok(self.export_view(composite.view(), rect))
@@ -471,6 +597,30 @@ impl Engine {
                 parent,
                 index,
             } => return Ok(Some(document.add_group(name, place(parent, index))?)),
+            Command::AddAdjustment {
+                name,
+                parent,
+                index,
+                adjustment,
+            } => {
+                return Ok(Some(document.add_adjustment(
+                    name,
+                    place(parent, index),
+                    adjustment,
+                )?));
+            }
+            Command::SetAdjustment { id, adjustment } => document.set_adjustment(id, adjustment)?,
+            Command::AddMask { id, reveal } => document.add_mask(id, reveal)?,
+            Command::RemoveMask { id } => document.remove_mask(id)?,
+            Command::PaintMaskStroke {
+                id,
+                value,
+                brush,
+                points,
+                dynamics,
+            } => {
+                self.paint_stroke(id, brush, dynamics, StrokeMode::Mask(value), &points)?;
+            }
             Command::DeleteLayer { id } => document.delete_layer(id)?,
             Command::MoveLayer { id, parent, index } => document.move_layer(id, parent, index)?,
             Command::RenameLayer { id, name } => document.rename_layer(id, name)?,
@@ -484,14 +634,20 @@ impl Engine {
                 layer,
                 brush,
                 points,
-            } => self.paint_stroke(layer, brush, BrushDynamics::default(), false, &points)?,
+            } => self.paint_stroke(
+                layer,
+                brush,
+                BrushDynamics::default(),
+                StrokeMode::Paint,
+                &points,
+            )?,
             Command::PaintWithDynamics {
                 layer,
                 brush,
                 points,
                 dynamics,
             } => {
-                self.paint_stroke(layer, brush, dynamics, false, &points)?;
+                self.paint_stroke(layer, brush, dynamics, StrokeMode::Paint, &points)?;
             }
             Command::EraseStroke {
                 layer,
@@ -499,7 +655,7 @@ impl Engine {
                 points,
                 dynamics,
             } => {
-                self.paint_stroke(layer, brush, dynamics, true, &points)?;
+                self.paint_stroke(layer, brush, dynamics, StrokeMode::Erase, &points)?;
             }
             edit @ (Command::Crop { .. }
             | Command::ResizeCanvas { .. }
@@ -522,6 +678,9 @@ impl Engine {
         let (size, affine, layers) = match command {
             Command::SetLayerOpacity { id, opacity } => {
                 return Ok(PreviewEdit::Opacity { id, opacity });
+            }
+            Command::SetAdjustment { id, adjustment } => {
+                return Ok(PreviewEdit::Adjustment { id, adjustment });
             }
             Command::Crop { rect } => {
                 let rect = checked_region(old_size, Some(rect))?;
@@ -568,35 +727,41 @@ impl Engine {
             _ => return Err(EngineError::UnsupportedPreview),
         };
         self.gpu.check_size(size)?;
-        let mut edits = Vec::new();
+        let mut rasters = Vec::new();
+        let mut masks = Vec::new();
+        let changes = |before: &Tiles<TileRef>, reveal| {
+            let after = remap(&self.gpu, before, old_size, size, affine, reveal);
+            let mut changes: Vec<_> = before
+                .keys()
+                .filter(|coord| !after.contains_key(coord))
+                .map(|coord| (*coord, None))
+                .collect();
+            changes.extend(
+                after
+                    .into_iter()
+                    .filter(|(coord, tile)| {
+                        !before
+                            .get(coord)
+                            .is_some_and(|previous| Rc::ptr_eq(previous, tile))
+                    })
+                    .map(|(coord, tile)| (coord, Some(tile))),
+            );
+            changes
+        };
         for layer in layers {
             layer.visit(&mut |layer| {
                 if let Some(before) = layer.tiles() {
-                    let after = remap(&self.gpu, before, old_size, size, affine);
-                    let mut changes: Vec<_> = before
-                        .keys()
-                        .filter(|coord| !after.contains_key(coord))
-                        .map(|coord| (*coord, None))
-                        .collect();
-                    changes.extend(
-                        after
-                            .into_iter()
-                            .filter(|(coord, tile)| {
-                                !before
-                                    .get(coord)
-                                    .is_some_and(|previous| Rc::ptr_eq(previous, tile))
-                            })
-                            .map(|(coord, tile)| (coord, Some(tile))),
-                    );
-                    if !changes.is_empty() {
-                        edits.push((layer.id, changes));
-                    }
+                    rasters.push((layer.id, changes(before, false)));
+                }
+                if let Some(mask) = &layer.mask {
+                    masks.push((layer.id, changes(&mask.tiles, mask.reveal)));
                 }
             });
         }
-        Ok(PreviewEdit::Rasters {
+        Ok(PreviewEdit::Pixels {
             size,
-            layers: edits,
+            rasters,
+            masks,
         })
     }
 
@@ -605,7 +770,7 @@ impl Engine {
         layer: LayerId,
         brush: Brush,
         dynamics: BrushDynamics,
-        erase: bool,
+        mode: StrokeMode,
         points: &[StrokePoint],
     ) -> Result<(), EngineError> {
         let [start, rest @ ..] = points else {
@@ -614,7 +779,7 @@ impl Engine {
         if !points.iter().all(StrokePoint::is_valid) {
             return Err(EngineError::InvalidStroke);
         }
-        self.begin_stroke_on(layer, brush, dynamics, erase, *start)?;
+        self.begin_stroke_on(layer, brush, dynamics, mode, *start)?;
         for point in rest {
             self.extend_stroke(*point);
         }
@@ -626,7 +791,7 @@ impl Engine {
         layer: LayerId,
         brush: Brush,
         dynamics: BrushDynamics,
-        erase: bool,
+        mode: StrokeMode,
         start: StrokePoint,
     ) -> Result<(), EngineError> {
         if !brush.is_valid() || !dynamics.is_valid() {
@@ -635,11 +800,19 @@ impl Engine {
         if !start.is_valid() {
             return Err(EngineError::InvalidStroke);
         }
-        if self.document.layer(layer)?.tiles().is_none() {
+        let target = self.document.layer(layer)?;
+        if let StrokeMode::Mask(value) = mode {
+            if target.mask.is_none() {
+                return Err(DocumentError::NoMask(layer).into());
+            }
+            if !(0.0..=1.0).contains(&value) {
+                return Err(EngineError::InvalidMaskValue);
+            }
+        } else if target.tiles().is_none() {
             return Err(DocumentError::NotARasterLayer(layer).into());
         }
         self.stroke = Some(ActiveStroke::begin(
-            &self.gpu, layer, brush, dynamics, erase, start,
+            &self.gpu, layer, brush, dynamics, mode, start,
         ));
         Ok(())
     }
@@ -649,9 +822,17 @@ impl Engine {
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         if let Some(stroke) = &mut self.stroke {
             let layer = self.document.layer(stroke.layer())?;
-            let before = layer
-                .tiles()
-                .ok_or(DocumentError::NotARasterLayer(layer.id))?;
+            let before = if stroke.is_mask() {
+                let mask = layer.mask.as_ref().ok_or(DocumentError::NoMask(layer.id))?;
+                (&mask.tiles, mask.reveal)
+            } else {
+                (
+                    layer
+                        .tiles()
+                        .ok_or(DocumentError::NotARasterLayer(layer.id))?,
+                    false,
+                )
+            };
             let touched = stroke.record(
                 &self.gpu,
                 &mut encoder,
@@ -687,9 +868,10 @@ impl Engine {
     fn import_tiles(
         &self,
         size: (u32, u32),
-        rgba: &[u8],
+        pixels: &[u8],
         canvas: (u32, u32),
         position: (i32, i32),
+        mask: bool,
     ) -> Tiles<TileRef> {
         let (x, y) = position;
         if i64::from(x) + i64::from(size.0) <= 0
@@ -704,11 +886,15 @@ impl Engine {
             &texture_descriptor(
                 "imported image",
                 size,
-                IMAGE_FORMAT,
+                if mask {
+                    wgpu::TextureFormat::R8Unorm
+                } else {
+                    IMAGE_FORMAT
+                },
                 wgpu::TextureUsages::TEXTURE_BINDING,
             ),
             wgpu::util::TextureDataOrder::LayerMajor,
-            rgba,
+            pixels,
         );
         let uniform = self
             .gpu
@@ -725,16 +911,24 @@ impl Engine {
                 uniform.as_entire_binding(),
             ],
         );
+        let channels = if mask { 1 } else { RGBA_BYTES };
+        let pipeline = if mask {
+            &self.gpu.pipelines.import_mask
+        } else {
+            &self.gpu.pipelines.import
+        };
         let tiles = self.gpu.submit(|encoder| {
             TileCoord::all(canvas)
-                .filter(|coord| has_visible_pixels(*coord, canvas, size, position, rgba))
+                .filter(|coord| {
+                    has_visible_pixels(*coord, canvas, size, position, pixels, channels)
+                })
                 .map(|coord| {
                     let tile = self.gpu.new_tile();
                     let packed_coord = coord.y << 16 | coord.x;
                     let mut pass = begin_pass(encoder, tile.view(), CLEAR);
                     let (width, height) = coord.visible_size(canvas);
                     pass.set_scissor_rect(0, 0, width, height);
-                    pass.set_pipeline(&self.gpu.pipelines.import);
+                    pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, &bindings, &[]);
                     pass.draw(0..3, packed_coord..packed_coord + 1);
                     drop(pass);
@@ -780,7 +974,8 @@ fn has_visible_pixels(
     canvas: (u32, u32),
     size: (u32, u32),
     position: (i32, i32),
-    rgba: &[u8],
+    pixels: &[u8],
+    channels: usize,
 ) -> bool {
     let (left, top) = coord.origin();
     let (width, height) = coord.visible_size(canvas);
@@ -791,9 +986,9 @@ fn has_visible_pixels(
     let left = left.max(0);
     right > left
         && (top.max(0)..bottom).any(|y| {
-            let start = (y as usize * size.0 as usize + left as usize) * RGBA_BYTES;
-            rgba[start..start + (right - left) as usize * RGBA_BYTES]
-                .chunks_exact(RGBA_BYTES)
-                .any(|pixel| pixel[RGBA_BYTES - 1] > 0)
+            let start = (y as usize * size.0 as usize + left as usize) * channels;
+            pixels[start..start + (right - left) as usize * channels]
+                .chunks_exact(channels)
+                .any(|pixel| pixel[channels - 1] > 0)
         })
 }

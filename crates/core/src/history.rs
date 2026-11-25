@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::{Layer, LayerId, LayerProperties, TILE_BYTES, TileCoord};
+use crate::{Adjustment, Layer, LayerId, LayerMask, LayerProperties, TILE_BYTES, TileCoord};
 
 pub const DEFAULT_HISTORY_LIMIT: u64 = 256 * 1024 * 1024;
 
@@ -27,9 +27,18 @@ pub(crate) enum Edit<T> {
         id: LayerId,
         properties: LayerProperties,
     },
-    Rasters {
+    Pixels {
         size: (u32, u32),
-        layers: Vec<RasterEdit<T>>,
+        rasters: Vec<RasterEdit<T>>,
+        masks: Vec<RasterEdit<T>>,
+    },
+    Mask {
+        id: LayerId,
+        mask: Option<LayerMask<T>>,
+    },
+    Adjustment {
+        id: LayerId,
+        adjustment: Adjustment,
     },
 }
 
@@ -39,17 +48,26 @@ impl<T> Edit<T> {
             Self::Insert { layer, .. } => {
                 let mut bytes = 0;
                 layer.visit(&mut |layer| {
-                    bytes += ENTRY_BYTES + layer.tiles().map_or(0, |tiles| tile_bytes(tiles.len()));
+                    bytes += ENTRY_BYTES
+                        + layer.tiles().map_or(0, |tiles| tile_bytes(tiles.len()))
+                        + layer
+                            .mask
+                            .as_ref()
+                            .map_or(0, |mask| tile_bytes(mask.tiles.len()))
+                        + layer.grade().map_or(0, Adjustment::data_bytes);
                 });
                 bytes
             }
-            Self::Rasters { layers, .. } => layers
+            Self::Pixels { rasters, masks, .. } => rasters
                 .iter()
+                .chain(masks)
                 .map(|(_, tiles)| {
                     let kept = tiles.iter().filter(|(_, tile)| tile.is_some()).count();
                     tile_bytes(kept) + size_of_val(tiles.as_slice()) as u64
                 })
                 .sum(),
+            Self::Mask { mask, .. } => mask.as_ref().map_or(0, |mask| tile_bytes(mask.tiles.len())),
+            Self::Adjustment { adjustment, .. } => adjustment.data_bytes(),
             Self::Remove { .. } | Self::Move { .. } | Self::Properties { .. } => 0,
         };
         ENTRY_BYTES + payload

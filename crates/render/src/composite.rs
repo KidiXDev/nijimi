@@ -1,14 +1,20 @@
-use std::{collections::BTreeSet, rc::Rc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
 
 use bytemuck::{Pod, Zeroable};
-use nijimi_core::{BlendMode, Document, Layer, LayerContent, TILE_SIZE, TileCoord};
+use nijimi_core::{
+    Adjustment, BlendMode, Document, Layer, LayerContent, LayerId, TILE_SIZE, TileCoord, Tiles,
+};
 use wgpu::{
     BindingResource::{Buffer, Sampler, TextureView},
     util::DeviceExt,
 };
 
 use crate::{
-    gpu::{CLEAR, Gpu, begin_pass},
+    gpu::{CLEAR, Gpu, begin_pass, draw_fullscreen},
+    grade::{Grade, neighbors},
     stroke::ActiveStroke,
     tile::{TILE_FORMAT, TileRef},
 };
@@ -64,6 +70,7 @@ pub(crate) struct Composite {
     mipmaps: Vec<Mipmap>,
     present_bindings: wgpu::BindGroup,
     scratch: Vec<TileRef>,
+    was_graded: bool,
 }
 
 impl Composite {
@@ -110,6 +117,7 @@ impl Composite {
             mipmaps,
             present_bindings,
             scratch: Vec::new(),
+            was_graded: false,
         }
     }
 
@@ -133,24 +141,105 @@ impl Composite {
         stroke: Option<&ActiveStroke>,
         dirty: &BTreeSet<TileCoord>,
     ) {
+        gpu.luts.prune();
+        let layers = document.layers();
+        let graded = has_visible_grade(layers, |_| true);
+        // shortcut: spatial effects redraw the canvas, propagate dirty halos per stage if grading needs faster paint previews.
+        let expanded;
+        let dirty = if graded && has_visible_grade(layers, Adjustment::is_spatial) {
+            expanded = TileCoord::all(document.size()).collect::<BTreeSet<_>>();
+            &expanded
+        } else {
+            dirty
+        };
+        if self.was_graded && !graded {
+            self.scratch.truncate(32);
+        }
+        self.was_graded = graded;
         let mut planner = Planner {
             gpu,
             stroke,
             coord: TileCoord::new(0, 0),
+            size: document.size(),
             scratch: &mut self.scratch,
-            passes: Vec::new(),
+            operations: Vec::new(),
         };
-        for coord in dirty {
-            planner.coord = *coord;
-            let sources = planner.sources(document.layers());
-            planner.chain(sources, Target::Canvas(*coord));
+        let result = if graded {
+            Some(planner.graded_stack(layers, dirty))
+        } else {
+            for coord in dirty {
+                planner.coord = *coord;
+                let sources = planner.sources(layers, &mut BTreeMap::new());
+                planner.chain(sources, Target::Canvas(*coord), gpu.empty_tile.clone());
+            }
+            None
+        };
+        let operations = planner.operations;
+        for run in
+            operations.chunk_by(|a, b| matches!((a, b), (Operation::Blend(_), Operation::Blend(_))))
+        {
+            match &run[0] {
+                Operation::Blend(_) => {
+                    let passes: Vec<_> = run
+                        .iter()
+                        .map(|op| match op {
+                            Operation::Blend(pass) => pass,
+                            _ => unreachable!("blend passes are grouped together"),
+                        })
+                        .collect();
+                    self.draw_layers(gpu, encoder, &passes);
+                }
+                Operation::Kernel {
+                    target,
+                    bindings,
+                    mask,
+                } => {
+                    let pipeline = if *mask {
+                        &gpu.pipelines.apply_mask
+                    } else {
+                        &gpu.pipelines.grade
+                    };
+                    draw_fullscreen(encoder, target.view(), pipeline, bindings);
+                }
+            }
         }
-        let passes = planner.passes;
-        self.draw_layers(gpu, encoder, &passes);
+        if let Some(result) = result {
+            self.draw_graded(gpu, encoder, dirty, &result);
+            self.scratch.extend(result.into_values());
+        }
         self.draw_mipmaps(gpu, encoder, dirty);
     }
 
-    fn draw_layers(&self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, passes: &[Pass]) {
+    fn draw_graded(
+        &self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        dirty: &BTreeSet<TileCoord>,
+        tiles: &Tiles<TileRef>,
+    ) {
+        let mut pass = begin_pass(encoder, self.view(), wgpu::LoadOp::Load);
+        pass.set_pipeline(&gpu.pipelines.copy_tile);
+        for &coord in dirty {
+            let (x, y) = coord.origin();
+            let offset = gpu
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("tile origin"),
+                    contents: bytemuck::bytes_of(&[x as i32, y as i32, 0, 0]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let tile = tiles.get(&coord).unwrap_or(&gpu.empty_tile);
+            let bindings = gpu.bind(
+                &gpu.layouts.copy_tile,
+                &[TextureView(tile.view()), offset.as_entire_binding()],
+            );
+            self.canvas_rect(coord).scissor(&mut pass);
+            pass.set_bind_group(0, &bindings, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
+    fn draw_layers(&self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, passes: &[&Pass]) {
         let stride = size_of::<LayersUniform>()
             .next_multiple_of(gpu.device.limits().min_uniform_buffer_offset_alignment as usize);
         let mut uniforms = vec![0; stride * passes.len()];
@@ -283,29 +372,62 @@ impl Pass {
     }
 }
 
+enum Operation {
+    Blend(Pass),
+    Kernel {
+        target: TileRef,
+        bindings: wgpu::BindGroup,
+        mask: bool,
+    },
+}
+
+fn shown<T>(layer: &Layer<T>) -> bool {
+    layer.properties.visible && layer.properties.opacity > 0.0
+}
+
+fn has_visible_grade<T>(layers: &[Layer<T>], check: impl Fn(&Adjustment) -> bool + Copy) -> bool {
+    layers
+        .iter()
+        .filter(|layer| shown(layer))
+        .any(|layer| layer.grade().is_some_and(check) || has_visible_grade(layer.children(), check))
+}
+
 struct Planner<'a> {
     gpu: &'a Gpu,
     stroke: Option<&'a ActiveStroke>,
     coord: TileCoord,
     scratch: &'a mut Vec<TileRef>,
-    passes: Vec<Pass>,
+    size: (u32, u32),
+    operations: Vec<Operation>,
 }
 
 impl Planner<'_> {
-    fn sources(&mut self, layers: &[Layer<TileRef>]) -> Vec<Source> {
+    fn sources(
+        &mut self,
+        layers: &[Layer<TileRef>],
+        groups: &mut BTreeMap<LayerId, Tiles<TileRef>>,
+    ) -> Vec<Source> {
         layers
             .iter()
-            .filter(|layer| layer.properties.visible && layer.properties.opacity > 0.0)
+            .filter(|layer| shown(layer))
             .filter_map(|layer| {
                 let (tile, is_scratch) = match &layer.content {
                     LayerContent::Raster(tiles) => {
                         let painted = self
                             .stroke
-                            .and_then(|stroke| stroke.result(layer.id, self.coord));
+                            .and_then(|stroke| stroke.result(layer.id, self.coord, false));
                         (painted.or(tiles.get(&self.coord))?.clone(), false)
                     }
-                    LayerContent::Group(children) => (self.flatten_group(children)?, true),
+                    LayerContent::Group(children) => {
+                        let tile = match groups.get_mut(&layer.id) {
+                            Some(tiles) => tiles.remove(&self.coord),
+                            None => self.flatten_group(children),
+                        };
+                        (tile?, true)
+                    }
+                    LayerContent::Adjustment(_) => return None,
                 };
+                let (tile, is_scratch) = self.apply_mask(layer, tile, is_scratch)?;
                 Some(Source {
                     tile,
                     opacity: layer.properties.opacity,
@@ -316,18 +438,183 @@ impl Planner<'_> {
             .collect()
     }
 
+    fn mask_tile(&self, layer: &Layer<TileRef>, coord: TileCoord) -> TileRef {
+        if let Some(mask) = &layer.mask {
+            let painted = self
+                .stroke
+                .and_then(|stroke| stroke.result(layer.id, coord, true));
+            painted
+                .or(mask.tiles.get(&coord))
+                .unwrap_or_else(|| self.gpu.mask_default(mask.reveal))
+                .clone()
+        } else {
+            self.gpu.mask_default(true).clone()
+        }
+    }
+
+    fn apply_mask(
+        &mut self,
+        layer: &Layer<TileRef>,
+        tile: TileRef,
+        is_scratch: bool,
+    ) -> Option<(TileRef, bool)> {
+        if layer.mask.is_none() {
+            return Some((tile, is_scratch));
+        }
+        let mask = self.mask_tile(layer, self.coord);
+        if Rc::ptr_eq(&mask, self.gpu.mask_default(true)) {
+            return Some((tile, is_scratch));
+        }
+        if Rc::ptr_eq(&mask, &self.gpu.empty_tile) {
+            if is_scratch {
+                self.scratch.push(tile);
+            }
+            return None;
+        }
+        let target = self.take_scratch();
+        let bindings = self.gpu.bind(
+            &self.gpu.layouts.apply_mask,
+            &[TextureView(tile.view()), TextureView(mask.view())],
+        );
+        self.operations.push(Operation::Kernel {
+            target: target.clone(),
+            bindings,
+            mask: true,
+        });
+        if is_scratch {
+            self.scratch.push(tile);
+        }
+        Some((target, true))
+    }
+
     fn flatten_group(&mut self, children: &[Layer<TileRef>]) -> Option<TileRef> {
-        let sources = self.sources(children);
+        let sources = self.sources(children, &mut BTreeMap::new());
         if sources.is_empty() {
             return None;
         }
         let tile = self.take_scratch();
-        self.chain(sources, Target::Scratch(tile.clone()));
+        self.chain(
+            sources,
+            Target::Scratch(tile.clone()),
+            self.gpu.empty_tile.clone(),
+        );
         Some(tile)
     }
 
-    fn chain(&mut self, sources: Vec<Source>, target: Target) {
-        let mut backdrop = self.gpu.empty_tile.clone();
+    fn graded_stack(
+        &mut self,
+        layers: &[Layer<TileRef>],
+        coords: &BTreeSet<TileCoord>,
+    ) -> Tiles<TileRef> {
+        let mut groups = BTreeMap::new();
+        for layer in layers.iter().filter(|layer| shown(layer)) {
+            if has_visible_grade(layer.children(), |_| true) {
+                groups.insert(layer.id, self.graded_stack(layer.children(), coords));
+            }
+        }
+        let mut tiles = Tiles::new();
+        let mut start = 0;
+        for (index, layer) in layers.iter().enumerate().filter(|(_, layer)| shown(layer)) {
+            if let Some(adjustment) = layer.grade() {
+                self.blend_run(&layers[start..index], coords, &mut groups, &mut tiles);
+                tiles = self.apply_grade(layer, adjustment, coords, tiles);
+                start = index + 1;
+            }
+        }
+        self.blend_run(&layers[start..], coords, &mut groups, &mut tiles);
+        tiles
+    }
+
+    fn blend_run(
+        &mut self,
+        layers: &[Layer<TileRef>],
+        coords: &BTreeSet<TileCoord>,
+        groups: &mut BTreeMap<LayerId, Tiles<TileRef>>,
+        tiles: &mut Tiles<TileRef>,
+    ) {
+        if layers.is_empty() {
+            return;
+        }
+        for &coord in coords {
+            self.coord = coord;
+            let sources = self.sources(layers, groups);
+            if !sources.is_empty() {
+                let backdrop = tiles
+                    .remove(&coord)
+                    .unwrap_or_else(|| self.gpu.empty_tile.clone());
+                let target = self.take_scratch();
+                self.chain(sources, Target::Scratch(target.clone()), backdrop);
+                tiles.insert(coord, target);
+            }
+        }
+    }
+
+    fn apply_grade(
+        &mut self,
+        layer: &Layer<TileRef>,
+        adjustment: &Adjustment,
+        coords: &BTreeSet<TileCoord>,
+        before: Tiles<TileRef>,
+    ) -> Tiles<TileRef> {
+        if before.is_empty() || matches!(adjustment, Adjustment::Blur { radius: 0 }) {
+            return before;
+        }
+        let spatial = adjustment.is_spatial();
+        let grade = |horizontal| {
+            Grade::new(
+                self.gpu,
+                adjustment,
+                horizontal,
+                layer.properties.opacity,
+                shader_mode(layer.properties.blend_mode),
+            )
+        };
+        let result = if matches!(adjustment, Adjustment::Blur { .. }) {
+            let horizontal = self.grade_pass(layer, coords, &grade(true), &before, &before, true);
+            let result = self.grade_pass(layer, coords, &grade(false), &horizontal, &before, true);
+            self.scratch.extend(horizontal.into_values());
+            result
+        } else {
+            self.grade_pass(layer, coords, &grade(false), &before, &before, spatial)
+        };
+        self.scratch.extend(before.into_values());
+        result
+    }
+
+    fn grade_pass(
+        &mut self,
+        layer: &Layer<TileRef>,
+        coords: &BTreeSet<TileCoord>,
+        grade: &Grade,
+        input: &Tiles<TileRef>,
+        original: &Tiles<TileRef>,
+        spatial: bool,
+    ) -> Tiles<TileRef> {
+        let mut result = Tiles::new();
+        for &coord in coords {
+            let nearby = neighbors(self.gpu, coord, input, spatial);
+            let base = original.get(&coord).unwrap_or(&self.gpu.empty_tile);
+            if Rc::ptr_eq(base, &self.gpu.empty_tile)
+                && nearby
+                    .iter()
+                    .all(|tile| Rc::ptr_eq(tile, &self.gpu.empty_tile))
+            {
+                continue;
+            }
+            let mask = self.mask_tile(layer, coord);
+            let target = self.take_scratch();
+            let bindings = grade.bindings(self.gpu, self.size, coord, &nearby, base, &mask);
+            self.operations.push(Operation::Kernel {
+                target: target.clone(),
+                bindings,
+                mask: false,
+            });
+            result.insert(coord, target);
+        }
+        result
+    }
+
+    fn chain(&mut self, sources: Vec<Source>, target: Target, mut backdrop: TileRef) {
         let mut remaining = sources;
         while remaining.len() > LAYERS_PER_PASS {
             let rest = remaining.split_off(LAYERS_PER_PASS);
@@ -346,11 +633,11 @@ impl Planner<'_> {
         if !Rc::ptr_eq(&backdrop, &self.gpu.empty_tile) {
             self.scratch.push(backdrop.clone());
         }
-        self.passes.push(Pass {
+        self.operations.push(Operation::Blend(Pass {
             target,
             backdrop,
             sources,
-        });
+        }));
     }
 
     fn take_scratch(&mut self) -> TileRef {

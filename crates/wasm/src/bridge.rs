@@ -1,5 +1,7 @@
 use js_sys::JSON;
-use nijimi_core::{Document, Layer, LayerContent, LayerId, LayerPlace, LayerProperties};
+use nijimi_core::{
+    Adjustment, Document, Layer, LayerContent, LayerId, LayerPlace, LayerProperties, LutInfo,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use wasm_bindgen::prelude::*;
 
@@ -71,7 +73,43 @@ export interface FillOptions extends Point {
   tolerance?: number;
 }
 
+export type Rgb = [number, number, number];
+
+export type AdjustmentSettings =
+  | { type: 'brightnessContrast'; brightness: number; contrast: number }
+  | { type: 'levels'; black: number; white: number; gamma: number; outputBlack?: number; outputWhite?: number }
+  | { type: 'curves'; points: Point[] }
+  | { type: 'hsl'; hue: number; saturation: number; lightness: number }
+  | { type: 'colorBalance'; shadows: Rgb; midtones: Rgb; highlights: Rgb }
+  | { type: 'exposure'; stops: number }
+  | { type: 'sharpen'; amount: number }
+  | { type: 'blur'; radius: number }
+  | { type: 'vignette'; amount: number; radius: number; feather: number }
+  | { type: 'grain'; amount: number; seed?: number };
+
+export interface LutInfo {
+  title: string | null;
+  kind: 'oneDimensional' | 'threeDimensional';
+  size: number;
+  domainMin: Rgb;
+  domainMax: Rgb;
+}
+
+export type Adjustment = AdjustmentSettings | { type: 'lut'; table: LutInfo & { samples: Rgb[] } };
+
+/** Bins are indexed by sRGB byte value and exclude fully transparent pixels. */
+export interface Histogram {
+  red: number[];
+  green: number[];
+  blue: number[];
+  luma: number[];
+  pixels: number;
+}
+
+export type LayerPlacement = Pick<ImportOptions, 'name' | 'parent' | 'index'>;
+
 export type PreviewCommand =
+  | { type: 'setAdjustment'; id: number; adjustment: Adjustment }
   | { type: 'setLayerOpacity'; id: number; opacity: number }
   | { type: 'crop'; rect: PixelRect }
   | { type: 'resizeCanvas'; width: number; height: number; x?: number; y?: number }
@@ -92,6 +130,10 @@ export interface StrokePoint {
 export type Command =
   | { type: 'addLayer'; name?: string; parent?: number | null; index?: number }
   | { type: 'addGroup'; name?: string; parent?: number | null; index?: number }
+  | ({ type: 'addAdjustment'; adjustment: Adjustment } & LayerPlacement)
+  | { type: 'addMask'; id: number; reveal?: boolean }
+  | { type: 'removeMask'; id: number }
+  | { type: 'paintMaskStroke'; id: number; value: number; brush: Brush; points: StrokePoint[]; dynamics?: BrushDynamics }
   | { type: 'deleteLayer'; id: number }
   | { type: 'moveLayer'; id: number; parent: number | null; index: number }
   | { type: 'renameLayer'; id: number; name: string }
@@ -114,6 +156,7 @@ export type EditorEvent =
   | { type: 'layerMoved'; id: number }
   | { type: 'layerChanged'; id: number }
   | { type: 'pixelsChanged'; id: number }
+  | { type: 'maskChanged'; id: number }
   | { type: 'activeLayerChanged'; id: number | null }
   | { type: 'historyChanged'; canUndo: boolean; canRedo: boolean }
   | { type: 'deviceLost'; message: string }
@@ -125,7 +168,9 @@ export interface LayerState {
   visible: boolean;
   opacity: number;
   blendMode: BlendMode;
-  kind: 'raster' | 'group';
+  kind: 'raster' | 'group' | 'adjustment';
+  adjustment: AdjustmentSettings | { type: 'lut'; table: LutInfo } | null;
+  mask: { reveal: boolean } | null;
   children: LayerState[];
 }
 
@@ -192,7 +237,25 @@ struct LayerState<'a> {
     #[serde(flatten)]
     properties: &'a LayerProperties,
     kind: &'static str,
+    adjustment: Option<AdjustmentState<'a>>,
+    mask: Option<MaskState>,
     children: Vec<LayerState<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum AdjustmentState<'a> {
+    Settings(&'a Adjustment),
+    Lut {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        table: &'a LutInfo,
+    },
+}
+
+#[derive(Serialize)]
+struct MaskState {
+    reveal: bool,
 }
 
 impl<'a> EditorState<'a> {
@@ -218,7 +281,18 @@ fn layer_states<T>(layers: &[Layer<T>]) -> Vec<LayerState<'_>> {
             kind: match layer.content {
                 LayerContent::Raster(_) => "raster",
                 LayerContent::Group(_) => "group",
+                LayerContent::Adjustment(_) => "adjustment",
             },
+            adjustment: layer.grade().map(|adjustment| match adjustment {
+                Adjustment::Lut { table } => AdjustmentState::Lut {
+                    kind: "lut",
+                    table: &table.info,
+                },
+                _ => AdjustmentState::Settings(adjustment),
+            }),
+            mask: layer.mask.as_ref().map(|mask| MaskState {
+                reveal: mask.reveal,
+            }),
             children: layer_states(layer.children()),
         })
         .collect()
